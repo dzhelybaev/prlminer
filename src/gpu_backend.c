@@ -1,0 +1,435 @@
+// prlminer — NVIDIA GPU backend (CUDA driver API, PTX JIT-compiled by the driver).
+#include "backend.h"
+#include "cuda_drv.h"
+#include "log.h"
+#include "miner.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+extern const char prl_ptx_sm80_noise[], prl_ptx_sm80_mma32[], prl_ptx_sm80_mma16[], prl_ptx_sm80_mma8[],
+    prl_ptx_sm80_dp4a32[], prl_ptx_sm80_dp4a16[], prl_ptx_sm80_dp4a8[];
+extern const char prl_ptx_sm61_noise[], prl_ptx_sm61_dp4a32[], prl_ptx_sm61_dp4a16[], prl_ptx_sm61_dp4a8[];
+
+static const char *ptx_for(bool sm80, const char *kind) {
+    static const struct { const char *k; const char *p80, *p61; } T[] = {
+        {"noise", prl_ptx_sm80_noise, prl_ptx_sm61_noise},   {"mma32", prl_ptx_sm80_mma32, NULL},
+        {"mma16", prl_ptx_sm80_mma16, NULL},                 {"mma8", prl_ptx_sm80_mma8, NULL},
+        {"dp4a32", prl_ptx_sm80_dp4a32, prl_ptx_sm61_dp4a32}, {"dp4a16", prl_ptx_sm80_dp4a16, prl_ptx_sm61_dp4a16},
+        {"dp4a8", prl_ptx_sm80_dp4a8, prl_ptx_sm61_dp4a8}};
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++)
+        if (!strcmp(T[i].k, kind)) return sm80 ? T[i].p80 : T[i].p61;
+    return NULL;
+}
+
+#define BM 128
+#define BN 256
+#define SMEM_MMA (3 * (BM + BN) * 48)
+#define SMEM_DP4A_SM61 (2 * (BM + BN) * 48)
+#define CAND_CAP 64
+#define CAND_WORDS (4 + 4 * CAND_CAP)
+
+volatile int g_benchmark;
+
+struct gpu_dev {
+    int idx;
+    gpu_info info;
+    CUcontext ctx;
+    CUstream st;
+    CUfunction f_uni, f_perm, f_apply, f_mine;
+    unsigned smem;
+    bool mma;
+    int m, geom;
+    pthread_t th;
+};
+
+static gpu_dev *g_devs[MAX_DEV];
+static int g_ndevs;
+
+#define CK(call)                                                                              \
+    do {                                                                                      \
+        CUresult _r = (call);                                                                 \
+        if (_r) { LOGE("GPU%d: %s failed: %s", d->idx, #call, cu_errstr(_r)); goto fail; }    \
+    } while (0)
+
+int gpu_list(gpu_info *out, int cap, char *err, int errlen) {
+    if (cuda_load(err, errlen)) return -1;
+    int n = 0;
+    if (cu.DeviceGetCount(&n)) { snprintf(err, errlen, "cuDeviceGetCount failed"); return -1; }
+    if (n > cap) n = cap;
+    for (int i = 0; i < n; i++) {
+        gpu_info *g = &out[i];
+        memset(g, 0, sizeof(*g));
+        CUdevice dv;
+        cu.DeviceGet(&dv, i);
+        g->ordinal = i;
+        cu.DeviceGetName(g->name, sizeof g->name, dv);
+        int bus = 0, dev = 0, dom = 0;
+        cu.DeviceGetAttribute(&bus, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, dv);
+        cu.DeviceGetAttribute(&dev, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, dv);
+        cu.DeviceGetAttribute(&dom, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, dv);
+        g->bus = bus;
+        snprintf(g->busid, sizeof g->busid, "%02x:%02x.0", bus, dev);
+        cu.DeviceGetAttribute(&g->cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dv);
+        cu.DeviceGetAttribute(&g->cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dv);
+        cu.DeviceGetAttribute(&g->sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dv);
+        size_t mem = 0;
+        cu.DeviceTotalMem(&mem, dv);
+        g->mem = mem;
+    }
+    return n;
+}
+
+static int load_module(gpu_dev *d, CUmodule *mod, const char *ptx, const char *what) {
+    static char elog[8192];
+    elog[0] = 0;
+    if (!ptx) { LOGE("GPU%d: no PTX for %s", d->idx, what); return -1; }
+    int opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+    void *vals[] = {elog, (void *)(size_t)sizeof elog};
+    double t0 = now_sec();
+    CUresult r = cu.ModuleLoadDataEx(mod, ptx, 2, opts, vals);
+    if (r) { LOGE("GPU%d: PTX JIT of %s failed: %s %s", d->idx, what, cu_errstr(r), elog); return -1; }
+    LOGD("GPU%d: %s kernels JIT-compiled in %.1f s", d->idx, what, now_sec() - t0);
+    return 0;
+}
+
+static CUresult launch(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsigned smem, void **args) {
+    return cu.LaunchKernel(f, gx, gy, 1, 256, 1, 1, smem, d->st, args, NULL);
+}
+
+// ------------------------------------------------------------------ device-side primitives
+typedef struct {
+    CUdeviceptr base, uni, pairs, out, seed;
+} noise_bufs;
+
+// out = base (+ nonce patch) + noise(label, seed) for `rows` rows of length k
+static CUresult run_noise(gpu_dev *d, noise_bufs *b, unsigned label, unsigned rows, unsigned k, uint64_t nonce,
+                          unsigned patch) {
+    CUresult r;
+    unsigned nblocks = rows * 4;
+    void *a1[] = {&b->seed, &label, &nblocks, &b->uni};
+    if ((r = launch(d, d->f_uni, (nblocks + 255) / 256, 1, 0, a1))) return r;
+    void *a2[] = {&b->seed, &label, &k, &b->pairs};
+    if ((r = launch(d, d->f_perm, (k / 8 + 255) / 256, 1, 0, a2))) return r;
+    unsigned lo = (unsigned)nonce, hi = (unsigned)(nonce >> 32);
+    unsigned long long total = (unsigned long long)rows * (k / 16);
+    void *a3[] = {&b->base, &b->uni, &b->pairs, &b->out, &rows, &k, &lo, &hi, &patch};
+    return launch(d, d->f_apply, (unsigned)((total + 255) / 256), 1, 0, a3);
+}
+
+static CUresult run_mine(gpu_dev *d, CUfunction f, unsigned smem, CUdeviceptr An, CUdeviceptr Bn, unsigned m,
+                         unsigned n, unsigned k, CUdeviceptr seed, CUdeviceptr bound, CUdeviceptr cand, CUdeviceptr dbg) {
+    unsigned cap = CAND_CAP;
+    void *args[] = {&An, &Bn, &m, &n, &k, &seed, &bound, &cand, &cap, &dbg};
+    return launch(d, f, n / BN, m / BM, smem, args);
+}
+
+// ------------------------------------------------------------------ self-test
+// Small problem (m=128, n=256, k=2048): GPU noise + transcripts must match the CPU core bit-for-bit.
+static int selftest_kernel(gpu_dev *d, CUfunction fmine, unsigned smem, const char *name) {
+    const unsigned m = 128, n = 256, k = 2048;
+    const int nt = g_miner.nt;
+    int ok = 0;
+    CUdeviceptr dA = 0, dAn = 0, dB = 0, dBn = 0, dUa = 0, dUb = 0, dPa = 0, dPb = 0, dSa = 0, dSb = 0, dBound = 0,
+                dCand = 0, dDbg = 0;
+    size_t ntiles = (m / 2) * (n / (2 * nt));
+    int8_t *A = malloc(m * k), *Bt = malloc(n * k), *An = malloc(m * k), *Bn = malloc(n * k);
+    uint32_t *dbg = malloc(ntiles * 64), *cand = malloc(CAND_WORDS * 4);
+    uint8_t sa[32], sb[32];
+    uint64_t s = 0x1234567 + d->idx;
+    for (unsigned i = 0; i < m * k; i++) { s = s * 6364136223846793005ULL + 1; A[i] = (int8_t)((int)((s >> 33) % 129) - 64); }
+    for (unsigned i = 0; i < n * k; i++) { s = s * 6364136223846793005ULL + 1; Bt[i] = (int8_t)((int)((s >> 33) % 129) - 64); }
+    for (int i = 0; i < 32; i++) { s = s * 6364136223846793005ULL + 1; sa[i] = (uint8_t)(s >> 40); sb[i] = (uint8_t)(s >> 48); }
+    uint64_t nonce = 0x0f1e2d3c4b5a6978ULL;
+    CK(cu.MemAlloc(&dA, m * k)); CK(cu.MemAlloc(&dAn, m * k));
+    CK(cu.MemAlloc(&dB, n * k)); CK(cu.MemAlloc(&dBn, n * k));
+    CK(cu.MemAlloc(&dUa, m * 128)); CK(cu.MemAlloc(&dUb, n * 128));
+    CK(cu.MemAlloc(&dPa, 2 * k)); CK(cu.MemAlloc(&dPb, 2 * k));
+    CK(cu.MemAlloc(&dSa, 32)); CK(cu.MemAlloc(&dSb, 32)); CK(cu.MemAlloc(&dBound, 32));
+    CK(cu.MemAlloc(&dCand, CAND_WORDS * 4)); CK(cu.MemAlloc(&dDbg, ntiles * 64));
+    CK(cu.MemcpyHtoD(dA, A, m * k)); CK(cu.MemcpyHtoD(dB, Bt, n * k));
+    CK(cu.MemcpyHtoD(dSa, sa, 32)); CK(cu.MemcpyHtoD(dSb, sb, 32));
+    {
+        noise_bufs na = {dA, dUa, dPa, dAn, dSa}, nb = {dB, dUb, dPb, dBn, dSb};
+        CK(run_noise(d, &na, 0, m, k, nonce, 1));
+        CK(run_noise(d, &nb, 1, n, k, 0, 0));
+    }
+    CK(cu.StreamSynchronize(d->st));
+    CK(cu.MemcpyDtoH(An, dAn, m * k));
+    CK(cu.MemcpyDtoH(Bn, dBn, n * k));
+    {   // CPU noise reference
+        uint8_t *perm = malloc(2 * k);
+        int8_t uni[128], *nz = malloc(k);
+        int bad = 0;
+        prl_noise_perm(PRL_LABEL_A, sa, (int)k, perm);
+        for (unsigned r = 0; r < m; r++) {
+            int8_t row[2048];
+            memcpy(row, A + r * k, k);
+            if (r == 0) prl_apply_nonce(row, nonce);
+            prl_noise_uniform_row(PRL_LABEL_A, sa, r, uni);
+            prl_noise_row(uni, perm, (int)k, nz);
+            for (unsigned l = 0; l < k; l++) bad += (int8_t)(row[l] + nz[l]) != An[r * k + l];
+        }
+        prl_noise_perm(PRL_LABEL_B, sb, (int)k, perm);
+        for (unsigned r = 0; r < n; r++) {
+            prl_noise_uniform_row(PRL_LABEL_B, sb, r, uni);
+            prl_noise_row(uni, perm, (int)k, nz);
+            for (unsigned l = 0; l < k; l++) bad += (int8_t)(Bt[r * k + l] + nz[l]) != Bn[r * k + l];
+        }
+        free(perm); free(nz);
+        if (bad) { LOGE("GPU%d: self-test: noise kernels mismatch (%d bytes)", d->idx, bad); goto fail; }
+    }
+    {   // transcripts for every tile + candidate reporting with an "accept everything" bound
+        uint32_t bound[8];
+        memset(bound, 0xff, sizeof bound);
+        CK(cu.MemcpyHtoD(dBound, bound, 32));
+        CK(cu.MemsetD32Async(dCand, 0, CAND_WORDS, d->st));
+        CK(run_mine(d, fmine, smem, dAn, dBn, m, n, k, dSa, dBound, dCand, dDbg));
+        CK(cu.StreamSynchronize(d->st));
+        CK(cu.MemcpyDtoH(dbg, dDbg, ntiles * 64));
+        CK(cu.MemcpyDtoH(cand, dCand, CAND_WORDS * 4));
+        prl_geom g;
+        prl_geom_init(&g, m, n, k, nt);
+        int bad = 0;
+        size_t tiles_c = n / (2 * nt);
+        for (unsigned tr0 = 0; tr0 < m; tr0 += 16)
+            for (unsigned gg = 0; gg < 8; gg++)
+                for (unsigned c0 = 0; c0 < n; c0 += 8 * nt)
+                    for (unsigned qq = 0; qq < 4; qq++) {
+                        uint32_t tr = tr0 + gg, tc = c0 + 2 * qq, rows[2], cols[64], jp[16];
+                        prl_tile_rows(&g, tr, rows);
+                        prl_tile_cols(&g, tc, cols);
+                        const int8_t *ap[2] = {An + rows[0] * k, An + rows[1] * k}, *bp[64];
+                        for (int j = 0; j < g.w; j++) bp[j] = Bn + cols[j] * k;
+                        prl_jackpot(ap, 2, bp, g.w, (int)k, 128, jp);
+                        size_t rid = (tr / 16) * 8 + tr % 16, cid = (tc / (8 * nt)) * 4 + (tc % (8 * nt)) / 2;
+                        if (memcmp(jp, dbg + (rid * tiles_c + cid) * 16, 64)) bad++;
+                    }
+        if (bad) { LOGW("GPU%d: self-test: %s kernel: %d of %zu tiles wrong", d->idx, name, bad, ntiles); goto fail; }
+        if (cand[0] != ntiles) { LOGW("GPU%d: self-test: %s kernel reported %u of %zu candidates", d->idx, name, cand[0], ntiles); goto fail; }
+        // verify reported hash words for the first candidate
+        uint32_t tr = cand[4], tc = cand[5], rows[2], cols[64], jp[16];
+        prl_tile_rows(&g, tr, rows);
+        prl_tile_cols(&g, tc, cols);
+        const int8_t *ap[2] = {An + rows[0] * k, An + rows[1] * k}, *bp[64];
+        for (int j = 0; j < g.w; j++) bp[j] = Bn + cols[j] * k;
+        prl_jackpot(ap, 2, bp, g.w, (int)k, 128, jp);
+        uint8_t hh[32];
+        prl_jackpot_hash(jp, sa, hh);
+        uint32_t w7 = hh[28] | hh[29] << 8 | hh[30] << 16 | (uint32_t)hh[31] << 24;
+        if (w7 != cand[6]) { LOGW("GPU%d: self-test: %s kernel BLAKE3 mismatch", d->idx, name); goto fail; }
+    }
+    ok = 1;
+fail:
+    CUdeviceptr bufs[] = {dA, dAn, dB, dBn, dUa, dUb, dPa, dPb, dSa, dSb, dBound, dCand, dDbg};
+    for (size_t i = 0; i < sizeof bufs / sizeof bufs[0]; i++)
+        if (bufs[i]) cu.MemFree(bufs[i]);
+    free(A); free(Bt); free(An); free(Bn); free(dbg); free(cand);
+    return ok;
+}
+
+// ------------------------------------------------------------------ prepare
+gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int rows) {
+    gpu_dev *d = calloc(1, sizeof(gpu_dev));
+    d->idx = stat_idx;
+    d->info = *info;
+    dev_stats *ds = &g_miner.dev[stat_idx];
+    snprintf(ds->tag, sizeof ds->tag, "GPU%d", stat_idx);
+    snprintf(ds->name, sizeof ds->name, "%s", info->name);
+    snprintf(ds->busid, sizeof ds->busid, "%s", info->busid);
+    int cc = info->cc_major * 10 + info->cc_minor;
+    if (cc < 61) { LOGE("GPU%d %s: compute capability %d.%d is not supported (need 6.1+)", stat_idx, info->name,
+                        info->cc_major, info->cc_minor); free(d); return NULL; }
+    CUdevice dv;
+    CK(cu.DeviceGet(&dv, info->ordinal));
+    CK(cu.CtxCreate(&d->ctx, CU_CTX_SCHED_BLOCKING_SYNC, dv));
+    CK(cu.StreamCreate(&d->st, 0));
+    {
+        bool sm80 = cc >= 80;
+        CUmodule mn;
+        if (load_module(d, &mn, ptx_for(sm80, "noise"), "noise")) goto fail;
+        CK(cu.ModuleGetFunction(&d->f_uni, mn, "k_noise_uniform"));
+        CK(cu.ModuleGetFunction(&d->f_perm, mn, "k_noise_perm"));
+        CK(cu.ModuleGetFunction(&d->f_apply, mn, "k_apply_noise"));
+        char kn[32], fname[64];
+        unsigned smem_dp4a = sm80 ? SMEM_MMA : SMEM_DP4A_SM61;
+        bool want_mma = sm80 && strcmp(kernel, "dp4a") != 0;
+        if (!strcmp(kernel, "mma") && !sm80) LOGW("GPU%d: tensor-core kernel needs compute 8.0+, using dp4a", stat_idx);
+        bool done = false;
+        if (want_mma) {
+            CUmodule mm;
+            CUfunction fm;
+            snprintf(kn, sizeof kn, "mma%d", g_miner.nt);
+            snprintf(fname, sizeof fname, "k_mine_mma_nt%d", g_miner.nt);
+            if (load_module(d, &mm, ptx_for(true, kn), kn)) goto fail;
+            CK(cu.ModuleGetFunction(&fm, mm, fname));
+            CK(cu.FuncSetAttribute(fm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_MMA));
+            if (selftest_kernel(d, fm, SMEM_MMA, "tensor-core")) {
+                d->f_mine = fm; d->smem = SMEM_MMA; d->mma = true; done = true;
+            } else LOGW("GPU%d: tensor-core kernel failed the self-test, falling back to dp4a", stat_idx);
+        }
+        if (!done) {
+            CUmodule md;
+            CUfunction fd;
+            snprintf(kn, sizeof kn, "dp4a%d", g_miner.nt);
+            snprintf(fname, sizeof fname, "k_mine_dp4a_nt%d", g_miner.nt);
+            if (load_module(d, &md, ptx_for(sm80, kn), kn)) goto fail;
+            CK(cu.ModuleGetFunction(&fd, md, fname));
+            if (smem_dp4a > 48 * 1024)
+                CK(cu.FuncSetAttribute(fd, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_dp4a));
+            if (selftest_kernel(d, fd, smem_dp4a, "dp4a")) { d->f_mine = fd; d->smem = smem_dp4a; d->mma = false; }
+            else { LOGE("GPU%d: all kernels failed the self-test, device disabled", stat_idx); goto fail; }
+        }
+        int regs = 0;
+        cu.FuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, d->f_mine);
+        snprintf(ds->kernel, sizeof ds->kernel, "%s-nt%d", d->mma ? "mma" : "dp4a", g_miner.nt);
+        LOGD("GPU%d: kernel %s, %d registers", stat_idx, ds->kernel, regs);
+    }
+    // rows: one 128-row block per SM per 256-column block -> grid = SMs x (n/256) blocks
+    d->m = rows > 0 ? rows : BM * info->sms;
+    d->m = (d->m + BM - 1) / BM * BM;
+    {
+        size_t need = (size_t)2 * d->m * g_miner.k + (size_t)2 * g_miner.n * g_miner.k + (64u << 20);
+        if (need > info->mem * 9 / 10) {
+            int maxm = (int)(((info->mem * 9 / 10) - (size_t)2 * g_miner.n * g_miner.k - (64u << 20)) /
+                             (2 * (size_t)g_miner.k) / BM * BM);
+            LOGW("GPU%d: not enough memory for %d rows, using %d", stat_idx, d->m, maxm);
+            d->m = maxm;
+        }
+        if (d->m < BM) goto fail;
+    }
+    d->geom = miner_add_geometry(d->m);
+    if (d->geom < 0) { LOGE("GPU%d: invalid geometry", stat_idx); goto fail; }
+    LOGI("GPU%d: %s [%s] cc %d.%d, %d SMs, %llu MB — kernel %s, self-test passed, matrix %dx%dx%d", stat_idx,
+         info->name, info->busid, info->cc_major, info->cc_minor, info->sms, info->mem >> 20, ds->kernel, d->m,
+         g_miner.n, g_miner.k);
+    cu.CtxSetCurrent(NULL);
+    return d;
+fail:
+    if (d->ctx) cu.CtxDestroy(d->ctx);
+    free(d);
+    return NULL;
+}
+
+// ------------------------------------------------------------------ mining loop
+typedef struct {
+    job_t *job;
+    uint64_t nonce;
+    CUdeviceptr dseed, dcand;
+    uint8_t *hseed;
+    uint32_t *hcand;
+    CUevent ev;
+    int busy;
+} slot_t;
+
+static void fatal_cuda(gpu_dev *d, const char *what, CUresult r) {
+    LOGE("GPU%d: %s failed: %s — exiting so the miner can be restarted", d->idx, what, cu_errstr(r));
+    fflush(stdout);
+    sleep(1);
+    _exit(42);
+}
+#define CKF(call) do { CUresult _r = (call); if (_r) fatal_cuda(d, #call, _r); } while (0)
+
+static void collect(gpu_dev *d, slot_t *s, uint64_t work) {
+    CKF(cu.EventSynchronize(s->ev));
+    uint32_t n = s->hcand[0];
+    if (n > CAND_CAP) {
+        LOGW("GPU%d: %u candidates in one attempt (cap %d) — share target is very easy", d->idx, n, CAND_CAP);
+        n = CAND_CAP;
+    }
+    for (uint32_t i = 0; i < n; i++)
+        miner_candidate(s->job, d->geom, d->idx, s->nonce, s->hcand[4 + 4 * i], s->hcand[5 + 4 * i]);
+    atomic_fetch_add(&g_miner.dev[d->idx].work, work);
+    job_release(s->job);
+    s->job = NULL;
+    s->busy = 0;
+}
+
+static void *gpu_main(void *arg) {
+    gpu_dev *d = arg;
+    miner_t *M = &g_miner;
+    const unsigned m = d->m, n = M->n, k = M->k;
+    CUdeviceptr dA, dAn, dB, dBn, dUa, dUb, dPa, dPb, dSb, dBound;
+    cu.CtxSetCurrent(d->ctx);
+    CKF(cu.MemAlloc(&dA, (size_t)m * k));
+    CKF(cu.MemAlloc(&dAn, (size_t)m * k));
+    CKF(cu.MemAlloc(&dB, (size_t)n * k));
+    CKF(cu.MemAlloc(&dBn, (size_t)n * k));
+    CKF(cu.MemAlloc(&dUa, (size_t)m * 128));
+    CKF(cu.MemAlloc(&dUb, (size_t)n * 128));
+    CKF(cu.MemAlloc(&dPa, 2 * k));
+    CKF(cu.MemAlloc(&dPb, 2 * k));
+    CKF(cu.MemAlloc(&dSb, 32));
+    CKF(cu.MemAlloc(&dBound, 32));
+    CKF(cu.MemcpyHtoD(dA, M->A_base, (size_t)m * k));
+    CKF(cu.MemcpyHtoD(dB, M->Bt_base, (size_t)n * k));
+    slot_t slots[2];
+    memset(slots, 0, sizeof slots);
+    for (int i = 0; i < 2; i++) {
+        CKF(cu.MemAlloc(&slots[i].dseed, 32));
+        CKF(cu.MemAlloc(&slots[i].dcand, CAND_WORDS * 4));
+        CKF(cu.MemAllocHost((void **)&slots[i].hseed, 32));
+        CKF(cu.MemAllocHost((void **)&slots[i].hcand, CAND_WORDS * 4));
+        CKF(cu.EventCreate(&slots[i].ev, 1 /* blocking sync */));
+    }
+    uint8_t *hb = NULL;
+    CKF(cu.MemAllocHost((void **)&hb, 64));
+    const uint64_t work = (uint64_t)m * n * k;
+    M->dev[d->idx].active = 1;
+    uint8_t last_bseed[32];
+    int have_b = 0;
+    int cur = 0;
+    while (!M->quit) {
+        job_t *job = miner_wait_job(1.0);
+        if (!job) continue;
+        uint64_t seq = job->seq;
+        if (!have_b || memcmp(last_bseed, job->work->b_seed, 32)) {   // new header: noise B for this job
+            memcpy(hb, job->work->b_seed, 32);
+            CKF(cu.MemcpyHtoDAsync(dSb, hb, 32, d->st));
+            noise_bufs nb = {dB, dUb, dPb, dBn, dSb};
+            CKF(run_noise(d, &nb, 1, n, k, 0, 0));
+            memcpy(last_bseed, job->work->b_seed, 32);
+            have_b = 1;
+        }
+        memcpy(hb + 32, job->bound.w, 32);
+        CKF(cu.MemcpyHtoDAsync(dBound, hb + 32, 32, d->st));
+        CKF(cu.StreamSynchronize(d->st));
+        while (!M->quit && miner_seq() == seq) {
+            slot_t *s = &slots[cur];
+            if (s->busy) collect(d, s, work);
+            s->nonce = miner_next_nonce();
+            uint8_t chunk0[PRL_CHUNK];
+            miner_attempt_chunk0(job->work, d->geom, s->nonce, chunk0, s->hseed);
+            s->job = job;
+            atomic_fetch_add(&job->refs, 1);
+            CKF(cu.MemcpyHtoDAsync(s->dseed, s->hseed, 32, d->st));
+            CKF(cu.MemsetD32Async(s->dcand, 0, 4, d->st));
+            noise_bufs na = {dA, dUa, dPa, dAn, s->dseed};
+            CKF(run_noise(d, &na, 0, m, k, s->nonce, 1));
+            CKF(run_mine(d, d->f_mine, d->smem, dAn, dBn, m, n, k, s->dseed, dBound, s->dcand, 0));
+            CKF(cu.MemcpyDtoHAsync(s->hcand, s->dcand, CAND_WORDS * 4, d->st));
+            CKF(cu.EventRecord(s->ev, d->st));
+            s->busy = 1;
+            cur ^= 1;
+            slot_t *o = &slots[cur];
+            if (o->busy) collect(d, o, work);
+        }
+        for (int i = 0; i < 2; i++)
+            if (slots[i].busy) collect(d, &slots[i], work);
+        job_release(job);
+    }
+    M->dev[d->idx].active = 0;
+    return NULL;
+}
+
+int gpu_launch(gpu_dev *d) {
+    if (g_ndevs >= MAX_DEV) return -1;
+    g_devs[g_ndevs++] = d;
+    return pthread_create(&d->th, NULL, gpu_main, d);
+}
+
+void gpu_join_all(void) {
+    for (int i = 0; i < g_ndevs; i++) pthread_join(g_devs[i]->th, NULL);
+}
