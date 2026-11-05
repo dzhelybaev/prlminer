@@ -51,7 +51,7 @@ Hash-тайл берётся из официального майнера: rows 
 | Поле | Значение |
 |---|---|
 | Miner name | `prlminer` |
-| Installation URL | ссылка на `prlminer-1.0.1.tar.gz` |
+| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/prlminer-1.0.1.tar.gz` |
 | Hash algorithm | `pearlhash` |
 | Wallet and worker template | `%WAL%.%WORKER_NAME%` |
 | Pool URL | например `pearl-eu2.luckypool.io:3360` (несколько адресов через пробел = резерв) |
