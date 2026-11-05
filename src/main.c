@@ -29,7 +29,7 @@ static void usage(void) {
         "      --kernel K          auto | mma (tensor cores, RTX 20xx+) | dp4a (default auto)\n"
         "      --fused M           auto | on | off: noise generated inside the GEMM kernel\n"
         "                          (auto = measure all kernels at start, use the fastest; default auto)\n"
-        "      --variant V         force a kernel variant: fmma | v2a..v2c | v3a | v3b | v4a..v4c (default: fastest)\n"
+        "      --variant V         force a kernel variant: fmma | v2a..v2c | v3a | v3b | v4a..v4c | l2a | l2b | l3b | l4c (default: fastest)\n"
         "      --rows N            matrix rows per attempt (default: 128 x SM count)\n"
         "      --list-devices      list GPUs and exit\n"
         "      --selftest          run the GPU self-test and exit\n"
@@ -38,7 +38,7 @@ static void usage(void) {
         "protocol:\n"
         "      --tile W            hash tile width / 2: 32 (official 2x64, default), 16, 8\n"
         "      --k K               common dimension (default 8192)\n"
-        "      --cols N            matrix columns (default 2048)\n"
+        "      --cols N            matrix columns (default 1024; B' = N x 8 KB stays in L2)\n"
         "      --cert C            auto | 2 | 3: noise-seed derivation (auto: v3 from height %d)\n"
         "      --salted-height H   fork height for v3 seeds in auto mode\n"
         "      --share-target T    scaled (target x tile work, default) | raw\n"
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     int npools = 0;
     const char *user = NULL, *worker = NULL, *pass = "x", *devices = NULL, *kernel = "auto", *cert = "auto";
     const char *api_host = "127.0.0.1", *logfile = NULL;
-    int rows = 0, tile = 32, k = 8192, cols = 2048, api_port = 4068, list = 0, selftest = 0, use_cpu = 0, bench_mma = 0;
+    int rows = 0, tile = 32, k = 8192, cols = 1024, api_port = 4068, list = 0, selftest = 0, use_cpu = 0, bench_mma = 0;
     int salted_h = 99000, bench = 0, print_iv = 30;
     double bench_diff = 100000;
     static struct option opts[] = {

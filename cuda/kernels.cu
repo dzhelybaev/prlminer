@@ -104,7 +104,8 @@ KERNEL void k_apply_noise(const i8 *base, const i8 *uni, const u8 *pairs, i8 *ou
         const u32 *pp = (const u32 *)(sp + 32 * s);
         u32 *dst = (u32 *)(out + (u64)r * k + 16 * s);
         bool nonce = patch && r == 0 && s == 0;
-        u32 bw4[4] = {src[0], src[1], src[2], src[3]}, res4[4];
+        u32 bw4[4] = {0, 0, 0, 0}, res4[4];
+        if (base) { bw4[0] = src[0]; bw4[1] = src[1]; bw4[2] = src[2]; bw4[3] = src[3]; }   // NULL base = zeros
 #pragma unroll
         for (int q = 0; q < 4; q++) {
             u32 bw = bw4[q], p0 = pp[2 * q], p1 = pp[2 * q + 1], res = 0;
@@ -391,7 +392,9 @@ DEVINL u32 v2_off(u32 r, u32 c) { return (r >> 2) * 128u + 16u * ((2u * (r & 3u)
 // DIAG (benchmark only, results are wrong): 1 no noise generation, 2 no B loads, 4 no barriers, 8 no fold
 // HS = 2: a hash tile (8*NT columns) is split over two n-adjacent warps (warp tile 16*MT x 4*NT); the
 // partner warp hands its per-chunk XOR to the owner through shared memory, only owners keep transcripts.
-template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0, int HS = 1>
+// GEN = false ("L2" kernels): U is the noised A' (m x k) produced by k_apply_noise; the A tile is copied
+// like B (no noise generation in the GEMM). Meant for A' + B' resident in L2.
+template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0, int HS = 1, bool GEN = true>
 DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k,
                     const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
     constexpr int NTW = NT / HS;                 // n8 sub-tiles per warp
@@ -417,6 +420,8 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     const u32 g_st = v2_off(lane, warp >> 2) + 4 * (warp & 3);                                      // + 1024*j
     const u32 c_st = V2_SLICE_A + v2_off(tid >> 1, tid & 1);                                        // + 16*NTH*i
     const i8 *bsrc = Bt + (u64)(col0 + (tid >> 1)) * k + 16 * (tid & 1);                            // + 128k*i
+    const u32 a_st = v2_off(tid >> 1, tid & 1);                     // GEN = false: A chunk (threads < 256)
+    const i8 *asrc = U + (u64)(row0 + ((tid >> 1) & 127)) * k + 16 * (tid & 1);
     const saddr_t elt = sb + ELT + 4 * lane, jpa = sb + JPO + 4 * ot, xsa = sb + XSO + 4 * ot;
 
     i32 acc[MT][NTW][4];
@@ -433,7 +438,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     }
     const u32 *P32 = (const u32 *)P;
     u32 pw0, pw1, gen_kt = 0;
-    if (warp < 8) {   // stage this block's 128 uniform rows transposed: word (f, rg) = bytes U[rg + 32j][f]
+    if (GEN && warp < 8) {   // stage this block's 128 uniform rows transposed: word (f, rg) = bytes U[rg + 32j][f]
         const u32 fb = warp * 16;
         u32 x[4][4];
 #pragma unroll
@@ -481,6 +486,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     };
 #if !V2_ASYNC
     u32 breg[BKS][CPI][4];
+    u32 areg[BKS][4];
 #endif
     auto issue = [&](u32 st, u32 s) {
 #pragma unroll
@@ -502,7 +508,21 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
                 }
 #endif
             }
-            if (!(DIAG & 1) && warp < 8) gen_slice(As);   // 8 warps generate (spread evenly over the 4 schedulers)
+            if constexpr (!GEN) {
+                if (tid < 256) {
+                    const i8 *src = asrc + ks * 32;
+#if V2_ASYNC
+                    cp_async16s(As + a_st, src);
+#else
+                    if constexpr (PF) ldg128(areg[j], src);
+                    else {
+                        u32 t[4];
+                        ldg128(t, src);
+                        sts128s(As + a_st, t);
+                    }
+#endif
+                }
+            } else if (!(DIAG & 1) && warp < 8) gen_slice(As);   // 8 warps generate (spread over the 4 schedulers)
         }
     };
     auto commit = [&](u32 st) {
@@ -512,6 +532,12 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
             for (int j = 0; j < BKS; j++)
 #pragma unroll
                 for (int i = 0; i < CPI; i++) sts128s(sb + st * STAGE + j * V2_SLICE + c_st + 16 * NTH * i, breg[j][i]);
+            if constexpr (!GEN) {
+                if (tid < 256) {
+#pragma unroll
+                    for (int j = 0; j < BKS; j++) sts128s(sb + st * STAGE + j * V2_SLICE + a_st, areg[j]);
+                }
+            }
         }
 #endif
     };
@@ -751,6 +777,11 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_C>(
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v3a_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v3b_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A>(V2_PASS); }
+// L2 kernels: A' precomputed by k_apply_noise (U = A'), no noise generation inside the GEMM
+KERNEL LAUNCH_BOUNDS(256, 1) void k_l2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A, 0, 1, false>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_l2b_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 0, 1, false>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_l3b_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_B, 0, 1, false>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_l4c_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_C, false>(V2_PASS); }
 // v4: 512 threads, warp tile 32x64, hash tile split over 2 warps
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4a_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4b_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_B>(V2_PASS); }

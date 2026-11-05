@@ -128,7 +128,7 @@ portable: $(BUILD)/ejjjminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.13
+VERSION = 1.0.14
 package: $(BUILD)/ejjjminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/ejjjminer
 	cp $(BUILD)/ejjjminer-portable $(BUILD)/pkg/ejjjminer/ejjjminer
