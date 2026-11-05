@@ -53,8 +53,7 @@ static void test_noise() {
         std::vector<i8> base(rows * k), out(rows * k);
         for (auto &v : base) v = rnd_val();
         uint64_t nonce = 0xfedcba9876543210ULL;
-        u32 total = rows * (k / 16);
-        emu_launch((total + 255) / 256, 1, 256, 0, [&]() {
+        emu_launch((rows + APPLY_ROWS - 1) / APPLY_ROWS, 1, 256, 2 * k + APPLY_ROWS * 128, [&]() {
             k_apply_noise(base.data(), uni.data(), pairs.data(), out.data(), rows, k, (u32)nonce, (u32)(nonce >> 32), 1);
         });
         for (u32 r = 0; r < rows; r++) {

@@ -106,7 +106,7 @@ portable: $(BUILD)/prlminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.1
+VERSION = 1.0.2
 package: $(BUILD)/prlminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/prlminer
 	cp $(BUILD)/prlminer-portable $(BUILD)/pkg/prlminer/prlminer

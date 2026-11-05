@@ -29,6 +29,8 @@ static const char *ptx_for(bool sm80, const char *kind) {
 #define SMEM_MMA (3 * (BM + BN) * 48)
 #define SMEM_DP4A_SM61 (2 * (BM + BN) * 48)
 #define CAND_CAP 64
+#define APPLY_ROWS 16
+#define APPLY_SMEM(k) (2 * (k) + APPLY_ROWS * 128)
 #define CAND_WORDS (4 + 4 * CAND_CAP)
 
 volatile int g_benchmark;
@@ -114,9 +116,8 @@ static CUresult run_noise(gpu_dev *d, noise_bufs *b, unsigned label, unsigned ro
     void *a2[] = {&b->seed, &label, &k, &b->pairs};
     if ((r = launch(d, d->f_perm, (k / 8 + 255) / 256, 1, 0, a2))) return r;
     unsigned lo = (unsigned)nonce, hi = (unsigned)(nonce >> 32);
-    unsigned long long total = (unsigned long long)rows * (k / 16);
     void *a3[] = {&b->base, &b->uni, &b->pairs, &b->out, &rows, &k, &lo, &hi, &patch};
-    return launch(d, d->f_apply, (unsigned)((total + 255) / 256), 1, 0, a3);
+    return launch(d, d->f_apply, (rows + APPLY_ROWS - 1) / APPLY_ROWS, 1, APPLY_SMEM(k), a3);
 }
 
 static CUresult run_mine(gpu_dev *d, CUfunction f, unsigned smem, CUdeviceptr An, CUdeviceptr Bn, unsigned m,
@@ -253,6 +254,8 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
         CK(cu.ModuleGetFunction(&d->f_uni, mn, "k_noise_uniform"));
         CK(cu.ModuleGetFunction(&d->f_perm, mn, "k_noise_perm"));
         CK(cu.ModuleGetFunction(&d->f_apply, mn, "k_apply_noise"));
+        if (APPLY_SMEM(g_miner.k) > 48 * 1024)
+            CK(cu.FuncSetAttribute(d->f_apply, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, APPLY_SMEM(g_miner.k)));
         char kn[32], fname[64];
         unsigned smem_dp4a = sm80 ? SMEM_MMA : SMEM_DP4A_SM61;
         bool want_mma = sm80 && strcmp(kernel, "dp4a") != 0;

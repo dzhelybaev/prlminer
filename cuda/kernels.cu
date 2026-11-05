@@ -76,33 +76,51 @@ KERNEL void k_noise_perm(const u32 *key8, u32 label_b, u32 k, u8 *pairs) {
     }
 }
 
-// out[r][l] = base[r][l] + uni[r][first_l] - uni[r][second_l]; 16 elements per thread.
+// out[r][l] = base[r][l] + uni[r][first_l] - uni[r][second_l].
+// One block handles APPLY_ROWS rows; the permutation pairs (2k bytes, shared by all rows) and the
+// rows' 128-byte uniform vectors are staged in shared memory. Dynamic smem: 2k + APPLY_ROWS*128.
 // patch != 0: base[0][0..15] is replaced by the 16 nonce nibbles.
+#define APPLY_ROWS 16
 KERNEL void k_apply_noise(const i8 *base, const i8 *uni, const u8 *pairs, i8 *out, u32 rows, u32 k,
                           u32 nonce_lo, u32 nonce_hi, u32 patch) {
-    u64 gid = (u64)BID_Y * 65535ull * NTHREADS + (u64)BID_X * NTHREADS + TID_X;
-    u32 segs = k / 16;
-    if (gid >= (u64)rows * segs) return;
-    u32 r = (u32)(gid / segs), s = (u32)(gid % segs);
-    const i8 *ur = uni + (u64)r * 128;
-    const u32 *src = (const u32 *)(base + (u64)r * k + 16 * s);
-    const u32 *pp = (const u32 *)(pairs + 32 * s);   // 16 pairs = 32 bytes
-    u32 *dst = (u32 *)(out + (u64)r * k + 16 * s);
-    bool nonce = patch && r == 0 && s == 0;
+    DYN_SMEM(sm);
+    u8 *sp = sm;                       // 2k bytes
+    i8 *su = (i8 *)(sm + 2 * k);       // APPLY_ROWS x 128
+    const u32 tid = TID_X, r0 = BID_X * APPLY_ROWS;
+    for (u32 i = tid; i < 2 * k / 16; i += NTHREADS) cp_async16(sp + 16 * i, pairs + 16 * i);
+    for (u32 i = tid; i < APPLY_ROWS * 128 / 16; i += NTHREADS) {
+        u32 rr = r0 + (16 * i) / 128;
+        if (rr < rows) cp_async16(su + 16 * i, uni + (u64)r0 * 128 + 16 * i);
+    }
+    cp_async_commit();
+    cp_async_wait<0>();
+    BAR_SYNC();
+    const u32 segs = k / 16;
+    for (u32 w = tid; w < APPLY_ROWS * segs; w += NTHREADS) {
+        u32 rl = w / segs, s = w % segs, r = r0 + rl;
+        if (r >= rows) break;
+        const i8 *ur = su + rl * 128;
+        const u32 *src = (const u32 *)(base + (u64)r * k + 16 * s);
+        const u32 *pp = (const u32 *)(sp + 32 * s);
+        u32 *dst = (u32 *)(out + (u64)r * k + 16 * s);
+        bool nonce = patch && r == 0 && s == 0;
+        u32 bw4[4] = {src[0], src[1], src[2], src[3]}, res4[4];
 #pragma unroll
-    for (int w = 0; w < 4; w++) {
-        u32 bw = src[w], p0 = pp[2 * w], p1 = pp[2 * w + 1], res = 0;
+        for (int q = 0; q < 4; q++) {
+            u32 bw = bw4[q], p0 = pp[2 * q], p1 = pp[2 * q + 1], res = 0;
 #pragma unroll
-        for (int b = 0; b < 4; b++) {
-            int e = 4 * w + b;
-            u32 pw = b < 2 ? p0 : p1;
-            int f = (pw >> (16 * (b & 1))) & 0xff, sec = (pw >> (16 * (b & 1) + 8)) & 0xff;
-            int v = (int)(i8)(bw >> (8 * b));
-            if (nonce) v = (int)(((e < 8 ? (nonce_lo >> (4 * e)) : (nonce_hi >> (4 * (e - 8))))) & 15u);
-            v += (int)ur[f] - (int)ur[sec];
-            res |= (u32)(u8)(i8)v << (8 * b);
+            for (int b = 0; b < 4; b++) {
+                int e = 4 * q + b;
+                u32 pw = b < 2 ? p0 : p1;
+                int f = (pw >> (16 * (b & 1))) & 0xff, sec = (pw >> (16 * (b & 1) + 8)) & 0xff;
+                int v = (int)(i8)(bw >> (8 * b));
+                if (nonce) v = (int)(((e < 8 ? (nonce_lo >> (4 * e)) : (nonce_hi >> (4 * (e - 8))))) & 15u);
+                v += (int)ur[f] - (int)ur[sec];
+                res |= (u32)(u8)(i8)v << (8 * b);
+            }
+            res4[q] = res;
         }
-        dst[w] = res;
+        dst[0] = res4[0]; dst[1] = res4[1]; dst[2] = res4[2]; dst[3] = res4[3];
     }
 }
 

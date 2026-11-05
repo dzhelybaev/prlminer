@@ -89,7 +89,7 @@ CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned, unsigned bx
         auto base = A<const i8 *>(p, 0); auto uni = A<const i8 *>(p, 1); auto pairs = A<const u8 *>(p, 2);
         auto out = A<i8 *>(p, 3); auto rows = A<u32>(p, 4); auto k = A<u32>(p, 5); auto lo = A<u32>(p, 6);
         auto hi = A<u32>(p, 7); auto patch = A<u32>(p, 8);
-        emu_launch_serial(gx, gy, bx, [&]() { k_apply_noise(base, uni, pairs, out, rows, k, lo, hi, patch); });
+        emu_launch(gx, gy, bx, smem, [&]() { k_apply_noise(base, uni, pairs, out, rows, k, lo, hi, patch); });
         break;
     }
     default: {
