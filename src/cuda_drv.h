@@ -64,6 +64,7 @@ typedef struct {
     CUresult (*EventRecord)(CUevent, CUstream);
     CUresult (*EventSynchronize)(CUevent);
     CUresult (*EventElapsedTime)(float *, CUevent, CUevent);
+    CUresult (*StreamWaitEvent)(CUstream, CUevent, unsigned);
 } cuda_api;
 
 extern cuda_api cu;

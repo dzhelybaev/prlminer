@@ -49,6 +49,7 @@ int cuda_load(char *err, size_t errlen) {
     SYM(EventRecord, "cuEventRecord");
     SYM(EventSynchronize, "cuEventSynchronize");
     SYM(EventElapsedTime, "cuEventElapsedTime");
+    SYM(StreamWaitEvent, "cuStreamWaitEvent");
 #undef SYM
     CUresult r = cu.Init(0);
     if (r) { snprintf(err, errlen, "cuInit failed: %s", cu_errstr(r)); return -1; }

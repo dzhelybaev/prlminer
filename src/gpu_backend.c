@@ -76,7 +76,7 @@ struct gpu_dev {
     int idx;
     gpu_info info;
     CUcontext ctx;
-    CUstream st;
+    CUstream st, st2, lst;   // st: GEMM, st2: noise (L2 pipeline), lst: launch-stream override
     CUfunction f_uni, f_perm, f_apply, f_mine, f_fused;
     unsigned smem, smem_fused;
     bool mma, use_fused;
@@ -140,7 +140,7 @@ static int load_module(gpu_dev *d, CUmodule *mod, const char *ptx, const char *w
 
 static CUresult launch_t(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsigned threads, unsigned smem,
                          void **args) {
-    return cu.LaunchKernel(f, gx, gy, 1, threads, 1, 1, smem, d->st, args, NULL);
+    return cu.LaunchKernel(f, gx, gy, 1, threads, 1, 1, smem, d->lst ? d->lst : d->st, args, NULL);
 }
 static CUresult launch(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsigned smem, void **args) {
     return launch_t(d, f, gx, gy, 256, smem, args);
@@ -340,6 +340,7 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
     CK(cu.DeviceGet(&dv, info->ordinal));
     CK(cu.CtxCreate(&d->ctx, CU_CTX_SCHED_BLOCKING_SYNC, dv));
     CK(cu.StreamCreate(&d->st, 0));
+    CK(cu.StreamCreate(&d->st2, 0));
     {
         bool sm80 = cc >= 80;
         CUmodule mn;
@@ -428,7 +429,7 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
     }
     d->geom = miner_add_geometry(d->m);
     if (d->geom < 0) { LOGE("GPU%d: invalid geometry", stat_idx); goto fail; }
-    {   // L2 kernels: rows such that A' (m x k) + B' (n x k) fit in ~80% of L2 and blocks fill whole waves
+    {   // L2 kernels: rows such that 2 A' slots (m x k) + B' (n x k) fit in ~80% of L2, blocks fill whole waves
         int has_l2 = 0;
         for (int v = 0; v < d->nfv; v++) has_l2 |= d->fv[v].l2;
         int l2 = 0;
@@ -441,7 +442,7 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
                 int blocks = cb * rb, waves = (blocks + sms - 1) / sms;
                 double eff = (double)blocks / ((double)waves * sms);
                 if (eff < 0.9) continue;
-                if ((rb * 128.0 + n) * k <= cap) best = rb;           // largest that fits L2
+                if ((2 * rb * 128.0 + n) * k <= cap) best = rb;       // largest that fits L2 (double-buffered A')
                 else if (!fallback && rb * 128 >= 1024) fallback = rb;   // smallest decent one (small-L2 cards)
             }
             int rb = best ? best : fallback;
@@ -449,7 +450,7 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
                 d->m_l2 = rb * 128;
                 d->geom_l2 = miner_add_geometry(d->m_l2);
                 LOGI("GPU%d: L2 %d MB -> L2-kernel matrix %dx%dx%d (%s)", stat_idx, l2 >> 20, d->m_l2, g_miner.n,
-                     g_miner.k, best ? "A' + B' fit in L2" : "L2 too small, streams from memory");
+                     g_miner.k, best ? "2 x A' + B' fit in L2" : "L2 too small, streams from memory");
             }
         }
         if (!d->m_l2) {   // drop L2 variants
@@ -504,6 +505,51 @@ static void collect(gpu_dev *d, slot_t *s, uint64_t work) {
     s->busy = 0;
 }
 
+// ------------------------------------------------------------------ L2 pipeline
+// Two slots, two streams: the noise (A') of attempt i+1 is produced on st2 while the GEMM of attempt i runs on
+// st. A slot's A' buffer is reused only after its GEMM finished (l2_collect waits for it).
+typedef struct {
+    CUdeviceptr An, Ua, Pa, seed, cand;
+    uint8_t *hseed;
+    uint32_t *hcand;
+    CUevent ev, evn;
+    job_t *job;
+    uint64_t nonce;
+    int busy;
+} l2slot;
+
+static void l2_enqueue(gpu_dev *d, l2slot *s, CUdeviceptr Bn, CUdeviceptr bound, unsigned m, unsigned n, unsigned k,
+                       uint64_t nonce, CUfunction f, unsigned threads, unsigned smem) {
+    d->lst = d->st2;
+    CKF(cu.MemcpyHtoDAsync(s->seed, s->hseed, 32, d->st2));
+    noise_bufs na = {0, s->Ua, s->Pa, s->An, s->seed};
+    CKF(run_noise(d, &na, 0, m, k, nonce, 1, true));
+    CKF(cu.EventRecord(s->evn, d->st2));
+    d->lst = NULL;
+    CKF(cu.StreamWaitEvent(d->st, s->evn, 0));
+    CKF(cu.MemsetD32Async(s->cand, 0, 4, d->st));
+    CKF(run_mine_fused(d, f, threads, smem, s->An, s->Pa, nonce, Bn, m, n, k, s->seed, bound, s->cand, 0));
+    CKF(cu.MemcpyDtoHAsync(s->hcand, s->cand, CAND_WORDS * 4, d->st));
+    CKF(cu.EventRecord(s->ev, d->st));
+    s->busy = 1;
+}
+
+static void l2_collect(gpu_dev *d, l2slot *s, uint64_t work) {
+    CKF(cu.EventSynchronize(s->ev));
+    s->busy = 0;
+    if (!s->job) return;   // profiling run
+    uint32_t n = s->hcand[0];
+    if (n > CAND_CAP) {
+        LOGW("GPU%d: %u candidates in one attempt (cap %d) — share target is very easy", d->idx, n, CAND_CAP);
+        n = CAND_CAP;
+    }
+    for (uint32_t i = 0; i < n; i++)
+        miner_candidate(s->job, d->geom, d->idx, s->nonce, s->hcand[4 + 4 * i], s->hcand[5 + 4 * i]);
+    atomic_fetch_add(&g_miner.dev[d->idx].work, work);
+    job_release(s->job);
+    s->job = NULL;
+}
+
 static void *gpu_main(void *arg) {
     gpu_dev *d = arg;
     miner_t *M = &g_miner;
@@ -533,6 +579,26 @@ static void *gpu_main(void *arg) {
     }
     uint8_t *hb = NULL;
     CKF(cu.MemAllocHost((void **)&hb, 64));
+    l2slot ls[2];
+    memset(ls, 0, sizeof ls);
+    if (d->m_l2) {
+        for (int i = 0; i < 2; i++) {
+            l2slot *q = &ls[i];
+            if (i == 0) { q->An = dAn; q->Ua = dUa; q->Pa = dPa; }   // reuse the fused/classic buffers
+            else {
+                CKF(cu.MemAlloc(&q->An, (size_t)d->m_l2 * k));
+                CKF(cu.MemAlloc(&q->Ua, (size_t)d->m_l2 * 128));
+                CKF(cu.MemAlloc(&q->Pa, 2 * k));
+            }
+            CKF(cu.MemAlloc(&q->seed, 32));
+            CKF(cu.MemAlloc(&q->cand, CAND_WORDS * 4));
+            CKF(cu.MemAllocHost((void **)&q->hseed, 32));
+            CKF(cu.MemAllocHost((void **)&q->hcand, CAND_WORDS * 4));
+            memset(q->hseed, 0x5a + i, 32);
+            CKF(cu.EventCreate(&q->ev, 1));
+            CKF(cu.EventCreate(&q->evn, 1));
+        }
+    }
     {   // one-time profile of a full-size attempt: noise vs GEMM time
         CUevent e0, e1, e2;
         CKF(cu.EventCreate(&e0, 0)); CKF(cu.EventCreate(&e1, 0)); CKF(cu.EventCreate(&e2, 0));
@@ -561,9 +627,41 @@ static void *gpu_main(void *arg) {
         double best = (g_fused_mode > 0 && d->nfv) ? 0 : (tn + tg > 0 ? (double)m * n * k / (tn + tg) : 0);
         int sel = -1;
         for (int v = 0; v < d->nfv; v++) {
+            if (g_variant && strcmp(d->fv[v].name, g_variant)) continue;   // forced variant: profile only it
             float tf = 0, tfn = 0, tmin = 1e30f;
             const int l2v = d->fv[v].l2;
             const unsigned mv = l2v ? (unsigned)d->m_l2 : m;
+            if (l2v) {   // steady-state pipelined throughput (wall clock, includes host overhead) + serial split
+                for (int pass = 0; pass < 2; pass++) {
+                    const int N = pass ? 32 : 4;   // pass 0 = warm-up
+                    CKF(cu.CtxSynchronize());
+                    double t0 = now_sec();
+                    for (int i = 0; i < N; i++) {
+                        l2slot *q = &ls[i & 1];
+                        if (q->busy) l2_collect(d, q, 0);
+                        l2_enqueue(d, q, dBn, dBound, mv, n, k, 1 + i, d->fv[v].f, d->fv[v].threads, d->fv[v].smem);
+                    }
+                    for (int i = 0; i < 2; i++)
+                        if (ls[i].busy) l2_collect(d, &ls[i], 0);
+                    tmin = (float)((now_sec() - t0) * 1e3 / N);
+                }
+                noise_bufs na = {0, dUa, dPa, dAn, slots[0].dseed};
+                CKF(cu.EventRecord(e0, d->st));
+                CKF(run_noise(d, &na, 0, mv, k, 1, 1, true));
+                CKF(cu.EventRecord(e1, d->st));
+                CKF(run_mine_fused(d, d->fv[v].f, d->fv[v].threads, d->fv[v].smem, dAn, dPa, 1, dBn, mv, n, k,
+                                   slots[0].dseed, dBound, slots[0].dcand, 0));
+                CKF(cu.EventRecord(e2, d->st));
+                CKF(cu.EventSynchronize(e2));
+                cu.EventElapsedTime(&tfn, e0, e1);
+                cu.EventElapsedTime(&tf, e1, e2);
+                double rate = tmin > 0 ? (double)mv * n * k / tmin : 0;
+                LOGI("GPU%d: profile: %-5s pipelined %.3f ms/attempt (%sH/s); serial: noise %.3f + GEMM %.3f ms "
+                     "(GEMM alone %.1f TH/s)", d->idx, d->fv[v].name, tmin, fmt_rate(rate * 1e3, b1, sizeof b1), tfn,
+                     tf, tf > 0 ? (double)mv * n * k / (tf * 1e-3) / 1e12 : 0);
+                if (rate > best) { best = rate; sel = v; }
+                continue;
+            }
             for (int it = 0; it < 4; it++) {
                 noise_bufs na = {l2v ? 0 : dA, dUa, dPa, dAn, slots[0].dseed};
                 CKF(cu.EventRecord(e0, d->st));
@@ -599,6 +697,42 @@ static void *gpu_main(void *arg) {
     const unsigned mr = d->use_l2 ? (unsigned)d->m_l2 : m;
     const uint64_t work_run = (uint64_t)mr * n * k;
     M->dev[d->idx].active = 1;
+    if (d->use_l2) {   // pipelined L2 loop
+        uint8_t lbs[32];
+        int hb_ok = 0, cur2 = 0;
+        while (!M->quit) {
+            job_t *job = miner_wait_job(1.0);
+            if (!job) continue;
+            uint64_t seq = job->seq;
+            if (!hb_ok || memcmp(lbs, job->work->b_seed, 32)) {
+                memcpy(hb, job->work->b_seed, 32);
+                CKF(cu.MemcpyHtoDAsync(dSb, hb, 32, d->st));
+                noise_bufs nb = {dB, dUb, dPb, dBn, dSb};
+                CKF(run_noise(d, &nb, 1, n, k, 0, 0, true));
+                memcpy(lbs, job->work->b_seed, 32);
+                hb_ok = 1;
+            }
+            memcpy(hb + 32, job->bound.w, 32);
+            CKF(cu.MemcpyHtoDAsync(dBound, hb + 32, 32, d->st));
+            CKF(cu.StreamSynchronize(d->st));
+            while (!M->quit && miner_seq() == seq) {
+                l2slot *q = &ls[cur2];
+                if (q->busy) l2_collect(d, q, work_run);
+                q->nonce = miner_next_nonce();
+                uint8_t chunk0[PRL_CHUNK];
+                miner_attempt_chunk0(job->work, d->geom, q->nonce, chunk0, q->hseed);
+                q->job = job;
+                atomic_fetch_add(&job->refs, 1);
+                l2_enqueue(d, q, dBn, dBound, mr, n, k, q->nonce, d->f_fused, d->threads_fused, d->smem_fused);
+                cur2 ^= 1;
+            }
+            for (int i = 0; i < 2; i++)
+                if (ls[i].busy) l2_collect(d, &ls[i], work_run);
+            job_release(job);
+        }
+        M->dev[d->idx].active = 0;
+        return NULL;
+    }
     uint8_t last_bseed[32];
     int have_b = 0;
     int cur = 0;

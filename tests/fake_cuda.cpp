@@ -73,6 +73,7 @@ CUresult cuEventCreate(void **e, unsigned) { *e = (void *)1; return 0; }
 CUresult cuEventRecord(void *, void *) { return 0; }
 CUresult cuEventSynchronize(void *) { return 0; }
 CUresult cuEventElapsedTime(float *t, void *, void *) { *t = 0; return 0; }
+CUresult cuStreamWaitEvent(void *, void *, unsigned) { return 0; }   // fake streams are synchronous
 
 CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned, unsigned bx, unsigned, unsigned, unsigned smem,
                         void *, void **p, void **) {
