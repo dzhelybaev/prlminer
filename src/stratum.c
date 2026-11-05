@@ -206,6 +206,7 @@ static void handle_line(const char *line, uint64_t gen) {
     for (int i = 0; i < PEND; i++)
         if (g_pend[i].id == id) { dev = g_pend[i].dev; t = g_pend[i].t; g_pend[i].id = 0; break; }
     pthread_mutex_unlock(&g_pend_mu);
+    if (dev >= 0 && !ok) LOGW("pool reply to share id %d: %.300s", id, line);
     if (dev >= 0) {
         g_ping_ms = (now_sec() - t) * 1e3;
         miner_on_share_result(dev, ok, code, msg);
@@ -265,6 +266,16 @@ static void *stratum_main(void *arg) {
             struct pollfd pfd = {fd, POLLIN, 0};
             int pr = poll(&pfd, 1, 500);
             if (pr < 0 && errno != EINTR) break;
+            {   // warn about shares the pool never answered
+                double t = now_sec();
+                pthread_mutex_lock(&g_pend_mu);
+                for (int i = 0; i < PEND; i++)
+                    if (g_pend[i].id && t - g_pend[i].t > 60) {
+                        LOGW("pool did not answer share id %d within 60 s", g_pend[i].id);
+                        g_pend[i].id = 0;
+                    }
+                pthread_mutex_unlock(&g_pend_mu);
+            }
             if (pr <= 0) {
                 if (now_sec() - last_rx > 600) { LOGW("no data from pool for 10 minutes, reconnecting"); break; }
                 continue;
@@ -315,7 +326,6 @@ int stratum_submit(const char *job_id, const uint8_t *proof, size_t plen, int de
     char *b64 = gz ? prl_base64(gz, glen) : prl_base64(proof, plen);
     free(gz);
     if (!b64) return -1;
-    if (g_gzip) LOGD("proof %zu bytes, gzip %zu bytes", plen, glen);
     int id;
     pthread_mutex_lock(&g_pend_mu);
     id = ++g_next_id;
@@ -337,6 +347,8 @@ int stratum_submit(const char *job_id, const uint8_t *proof, size_t plen, int de
     int rc = send_all(m, (size_t)n);
     free(m);
     if (rc) LOGW("failed to send share to pool");
+    else if (g_gzip) LOGI("share sent: id %d, proof %zu bytes, gzip %zu bytes", id, plen, glen);
+    else LOGI("share sent: id %d, proof %zu bytes (uncompressed)", id, plen);
     return rc;
 }
 
