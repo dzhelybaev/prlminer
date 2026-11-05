@@ -159,16 +159,16 @@ int main() {
     test_mine("k_mine_fmma_nt16", nullptr, 16, 256, 256, 2048, k_mine_fmma_nt16);
     test_mine("k_mine_fmma_nt8", nullptr, 8, 128, 512, 4096, k_mine_fmma_nt8);
     {
-        struct V { const char *name; fmine_fn f; int nt, mt, bks, stg, jps; } vs[] = {
+        struct V { const char *name; fmine_fn f; int nt, mt, bks, stg, jsm, pf; } vs[] = {
 #define VV(nm, f, nt, mt, ...) {nm, f, nt, mt, __VA_ARGS__}
             VV("k_v2a_nt16", k_v2a_nt16, 16, 2, V2_A), VV("k_v2b_nt16", k_v2b_nt16, 16, 2, V2_B),
             VV("k_v2c_nt16", k_v2c_nt16, 16, 2, V2_C), VV("k_v2a_nt32", k_v2a_nt32, 32, 1, V2_A),
             VV("k_v2b_nt32", k_v2b_nt32, 32, 1, V2_B), VV("k_v2c_nt32", k_v2c_nt32, 32, 1, V2_C)};
         for (auto &v : vs) {
-            u32 sm = v.stg * v.bks * V2_SLICE + 16384 + (v.jps ? 16384 * v.mt : 0);
+            u32 sm = v.stg * v.bks * V2_SLICE + 16384 + 16384 * (v.jsm < v.mt ? v.jsm : v.mt);
             test_mine(v.name, nullptr, v.nt, 128, 256, 2048, v.f, sm);
         }
-        test_mine("k_v2b_nt16 multi", nullptr, 16, 256, 512, 4096, k_v2b_nt16, 2 * 2 * V2_SLICE + 16384 + (V2_ASYNC ? 32768 : 0));
+        test_mine("k_v2a_nt16 multi", nullptr, 16, 256, 512, 4096, k_v2a_nt16, 131072);
     }
     if (fails) { printf("%d FAILURES\n", fails); return 1; }
     printf("ALL KERNEL EMULATION TESTS PASSED\n");

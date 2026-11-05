@@ -18,11 +18,12 @@ extern const char prl_ptx_sm75_fmma32[], prl_ptx_sm75_fmma16[], prl_ptx_sm75_fmm
 extern const char prl_ptx_sm80_v2_16[], prl_ptx_sm80_v2_32[], prl_ptx_sm75_v2_16[], prl_ptx_sm75_v2_32[];
 
 // v2 kernel variants: must match V2_A/V2_B/V2_C in cuda/kernels.cu
-typedef struct { char letter; int bks, stg, jps; } v2_variant;
-static const v2_variant V2_SM80[] = {{'a', 1, 4, 1}, {'b', 2, 2, 1}, {'c', 1, 3, 0}};
-static const v2_variant V2_SM75[] = {{'a', 1, 2, 0}, {'b', 2, 2, 0}};
+typedef struct { char letter; int bks, stg, jsm; } v2_variant;
+static const v2_variant V2_SM80[] = {{'a', 1, 4, 9}, {'b', 2, 2, 9}, {'c', 1, 3, 0}};
+static const v2_variant V2_SM75[] = {{'a', 1, 2, 1}, {'b', 1, 2, 1}, {'c', 1, 2, 0}};
 static unsigned v2_smem(const v2_variant *v, int nt) {
-    return (unsigned)(v->stg * v->bks * 12288 + 16384 + (v->jps ? 16384 * (32 / nt) : 0));
+    int mt = 32 / nt, js = v->jsm < mt ? v->jsm : mt;
+    return (unsigned)(v->stg * v->bks * 12288 + 16384 + 16384 * js);
 }
 
 static const char *ptx_turing_mma(int nt) {
@@ -359,7 +360,7 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
                     CUmodule m2;
                     if (!load_module(d, &m2, ptx, "v2")) {
                         const v2_variant *vt = sm80 ? V2_SM80 : V2_SM75;
-                        int nv = sm80 ? 3 : 2;
+                        int nv = 3;
                         for (int i = 0; i < nv; i++) {
                             char fn[32], nm[16];
                             snprintf(fn, sizeof fn, "k_v2%c_nt", vt[i].letter);

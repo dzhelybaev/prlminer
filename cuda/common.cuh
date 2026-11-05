@@ -47,6 +47,33 @@ template <int N> DEVINL void cp_async_wait() {}
 #endif
 
 DEVINL u32 atomic_add_u32(u32 *p, u32 v) { return (u32)__nvvm_atom_add_gen_i((int *)p, (int)v); }
+// 32-bit shared-window addresses (keeps address arithmetic in single registers)
+typedef u32 saddr_t;
+DEVINL saddr_t sbase(const void *p) { return smem_addr(p); }
+DEVINL u32 lds32(saddr_t a) {
+    u32 v;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(a));
+    return v;
+}
+DEVINL void sts32(saddr_t a, u32 v) { asm volatile("st.shared.u32 [%0], %1;" ::"r"(a), "r"(v) : "memory"); }
+DEVINL void sts128s(saddr_t a, const u32 r[4]) {
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(a), "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]) : "memory");
+}
+#if PRL_MMA && !PRL_TURING
+DEVINL void cp_async16s(saddr_t a, const void *g) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(a), "l"(g));
+}
+#else
+DEVINL void cp_async16s(saddr_t a, const void *g) { __builtin_trap(); }
+#endif
+#if PRL_MMA
+DEVINL void ldsm_x4(u32 r[4], saddr_t a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+#else
+DEVINL void ldsm_x4(u32 r[4], saddr_t a) { __builtin_trap(); }
+#endif
 #if PRL_MMA
 DEVINL void ldmatrix_x4(u32 r[4], const void *p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -111,6 +138,13 @@ DEVINL void cp_async_commit() {}
 template <int N> DEVINL void cp_async_wait() {}
 DEVINL u32 atomic_add_u32(u32 *p, u32 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 DEVINL void ldmatrix_x4(u32 r[4], const void *p) { emu_ldmatrix_x4(r, p); }
+typedef unsigned long long saddr_t;
+DEVINL saddr_t sbase(const void *p) { return (saddr_t)p; }
+DEVINL u32 lds32(saddr_t a) { u32 v; __builtin_memcpy(&v, (const void *)a, 4); return v; }
+DEVINL void sts32(saddr_t a, u32 v) { __builtin_memcpy((void *)a, &v, 4); }
+DEVINL void sts128s(saddr_t a, const u32 r[4]) { __builtin_memcpy((void *)a, r, 16); }
+DEVINL void cp_async16s(saddr_t a, const void *g) { __builtin_memcpy((void *)a, g, 16); }
+DEVINL void ldsm_x4(u32 r[4], saddr_t a) { emu_ldmatrix_x4(r, (const void *)a); }
 DEVINL u32 byte_perm(u32 a, u32 b, u32 s) {
     u64 x = (u64)a | ((u64)b << 32);
     u32 r = 0;
