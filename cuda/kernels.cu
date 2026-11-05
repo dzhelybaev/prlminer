@@ -389,38 +389,45 @@ DEVINL void sts128(void *p, const u32 r[4]) {
 DEVINL u32 v2_off(u32 r, u32 c) { return (r >> 2) * 128u + 16u * ((2u * (r & 3u) + c) ^ ((r >> 2) & 3u)); }
 
 // DIAG (benchmark only, results are wrong): 1 no noise generation, 2 no B loads, 4 no barriers, 8 no fold
-template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0>
+// HS = 2: a hash tile (8*NT columns) is split over two n-adjacent warps (warp tile 16*MT x 4*NT); the
+// partner warp hands its per-chunk XOR to the owner through shared memory, only owners keep transcripts.
+template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0, int HS = 1>
 DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k,
                     const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
-    constexpr int WARPS_N = BN / (8 * NT);
+    constexpr int NTW = NT / HS;                 // n8 sub-tiles per warp
+    constexpr int WARPS_N = BN / (8 * NTW);
     constexpr int NWARP = (BM / (16 * MT)) * WARPS_N, NTH = 32 * NWARP, CPI = 512 / NTH;   // threads, B chunks/thread
     constexpr int JS = JSM > MT ? MT : JSM;   // sub-tiles 0..JS-1 keep transcript words in smem
+    constexpr int NOWN = NTH / HS;               // threads that own hash tiles
     constexpr u32 STAGE = BKS * V2_SLICE;
     constexpr u32 ELT = STG * STAGE, JPO = ELT + 128 * 128;   // byte offsets of ELt and the transcript words
+    constexpr u32 XSO = JPO + 64 * JS * NOWN;                 // HS = 2: partner XOR exchange (MT words / owner)
     DYN_SMEM(smem);
     const saddr_t sb = sbase(smem);
     const u32 tid = TID_X, lane = tid & 31, warp = tid >> 5;
     const u32 g = lane >> 2, q = lane & 3;
     const u32 wm = warp / WARPS_N, wn = warp % WARPS_N;
     const u32 row0 = BID_Y * BM, col0 = BID_X * BN;
-    const u32 wrow = wm * 16 * MT, wcol = wn * 8 * NT;
+    const u32 wrow = wm * 16 * MT, wcol = wn * 8 * NTW;
+    const bool owner = HS == 1 || (wn & 1) == 0;
+    const u32 ot = HS == 1 ? tid : ((wm * (WARPS_N / 2) + wn / 2) * 32 + lane);   // owner-thread index
     // per-thread constant offsets (everything else is an immediate)
     const u32 a_ld = v2_off(wrow + (lane & 7) + 8 * ((lane >> 3) & 1), lane >> 4);                 // + 512*a
     const u32 b_ld = V2_SLICE_A + v2_off(wcol + 8 * (lane >> 4) + (lane & 7), (lane >> 3) & 1);    // + 512*bp
     const u32 g_st = v2_off(lane, warp >> 2) + 4 * (warp & 3);                                      // + 1024*j
     const u32 c_st = V2_SLICE_A + v2_off(tid >> 1, tid & 1);                                        // + 16*NTH*i
     const i8 *bsrc = Bt + (u64)(col0 + (tid >> 1)) * k + 16 * (tid & 1);                            // + 128k*i
-    const saddr_t elt = sb + ELT + 4 * lane, jpa = sb + JPO + 4 * tid;
+    const saddr_t elt = sb + ELT + 4 * lane, jpa = sb + JPO + 4 * ot, xsa = sb + XSO + 4 * ot;
 
-    i32 acc[MT][NT][4];
+    i32 acc[MT][NTW][4];
     u32 jpr[MT][16];
 #pragma unroll
     for (int a = 0; a < MT; a++) {
 #pragma unroll
-        for (int b = 0; b < NT; b++) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0;
+        for (int b = 0; b < NTW; b++) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0;
 #pragma unroll
         for (int j = 0; j < 16; j++) {
-            if (a < JS) sts32(jpa + 4 * NTH * (j * JS + a), 0);
+            if (a < JS) { if (owner) sts32(jpa + 4 * NOWN * (j * JS + a), 0); }
             else jpr[a][j] = 0;
         }
     }
@@ -512,7 +519,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
 #pragma unroll
         for (int a = 0; a < MT; a++) {
             if (a < JS) {
-                const saddr_t p = jpa + 4 * NTH * ((chunk & 15) * JS + a);
+                const saddr_t p = jpa + 4 * NOWN * ((chunk & 15) * JS + a);
                 sts32(p, rotl32(lds32(p), 13) ^ x[a]);
             } else {
                 u32 head = rotl32(jpr[a][0], 13) ^ x[a];
@@ -532,6 +539,9 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     // positions are compile-time, so the scheduler can interleave noise generation / copies with the mma's.
     // (The fold at k=0 is a no-op on all-zero state.)
     constexpr int G = 4 / BKS;
+    u32 xpend[MT];
+#pragma unroll
+    for (int a = 0; a < MT; a++) xpend[a] = 0;
     auto step = [&](u32 s0, int g, bool do_issue) __attribute__((always_inline)) {
         const u32 s = s0 + g;
         if constexpr (!(DIAG & 4)) {
@@ -556,7 +566,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
                 ldsm_x4(af[a], Sl + a_ld + 512 * a);
             }
 #pragma unroll
-            for (int bp = 0; bp < NT / 2; bp++) {
+            for (int bp = 0; bp < NTW / 2; bp++) {
                 u32 bf[4];
                 ldsm_x4(bf, Sl + b_ld + 512 * bp);
 #pragma unroll
@@ -570,7 +580,23 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
                     }
                 }
             }
-            if (fold) jp_update(ks / 4 - 1, x);
+            if (fold) {
+                if constexpr (HS == 1) jp_update(ks / 4 - 1, x);
+                else {
+#pragma unroll
+                    for (int a = 0; a < MT; a++) {
+                        if (owner) xpend[a] = x[a];
+                        else sts32(xsa + 4 * NOWN * a, x[a]);
+                    }
+                }
+            }
+            // HS = 2: one stage later (after a barrier) the owner merges the partner's XOR
+            if (HS == 2 && ((g * BKS + j) & 3) == BKS && owner) {
+                u32 xm[MT];
+#pragma unroll
+                for (int a = 0; a < MT; a++) xm[a] = xpend[a] ^ lds32(xsa + 4 * NOWN * a);
+                jp_update(ks / 4 - 1, xm);
+            }
         }
         if (do_issue) commit(st_i);
     };
@@ -590,11 +616,24 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         for (int a = 0; a < MT; a++) {
             x[a] = 0;
 #pragma unroll
-            for (int b = 0; b < NT; b++)
+            for (int b = 0; b < NTW; b++)
                 x[a] ^= (u32)acc[a][b][0] ^ (u32)acc[a][b][1] ^ (u32)acc[a][b][2] ^ (u32)acc[a][b][3];
         }
-        jp_update(nk / 4 - 1, x);
+        if constexpr (HS == 2) {
+            BAR_SYNC();   // everyone is done with the previous exchange
+            if (!owner) {
+#pragma unroll
+                for (int a = 0; a < MT; a++) sts32(xsa + 4 * NOWN * a, x[a]);
+            }
+            BAR_SYNC();
+            if (owner) {
+#pragma unroll
+                for (int a = 0; a < MT; a++) x[a] ^= lds32(xsa + 4 * NOWN * a);
+            }
+        }
+        if (owner) jp_update(nk / 4 - 1, x);
     }
+    if (!owner) return;
 
     u32 key[8], bound[8];
 #pragma unroll
@@ -605,7 +644,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         u32 words[16];
 #pragma unroll
         for (int j = 0; j < 16; j++) {
-            if (a < JS) words[j] = lds32(jpa + 4 * NTH * (j * JS + a));
+            if (a < JS) words[j] = lds32(jpa + 4 * NOWN * (j * JS + a));
             else words[j] = jpr[a][j];
         }
         u32 t_rows = row0 + wrow + 16 * a + g;
@@ -647,12 +686,24 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
 #define V2_C 1, 3, 0, false
 #define V3_A 1, 3, 9, false
 #define V3_B 2, 2, 9, false
+#define V3N8_A 1, 3, 1, false
+#define V3N8_B 2, 2, 1, false
+#define V3N8_C 2, 2, 0, false
+#define V4_A 1, 3, 9, false, 0, 2
+#define V4_B 1, 2, 9, false, 0, 2
+#define V4_C 2, 2, 9, false, 0, 2
 #else
 #define V2_A 1, 2, 1, true
 #define V2_B 1, 2, 1, false
 #define V2_C 1, 2, 0, true
 #define V3_A 1, 2, 0, true
 #define V3_B 1, 2, 0, false
+#define V3N8_A 1, 2, 0, true
+#define V3N8_B 1, 2, 0, false
+#define V3N8_C 2, 2, 0, false
+#define V4_A 1, 2, 1, true, 0, 2
+#define V4_B 1, 2, 1, false, 0, 2
+#define V4_C 1, 2, 0, true, 0, 2
 #endif
 
 #define MINE_ARGS const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 *seed8, const u32 *bound8, \
@@ -700,6 +751,10 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_C>(
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v3a_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v3b_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A>(V2_PASS); }
+// v4: 512 threads, warp tile 32x64, hash tile split over 2 warps
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v4a_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_A>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v4b_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_B>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v4c_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_C>(V2_PASS); }
 // --bench-mma breakdown of v2b (wrong results by design)
 KERNEL LAUNCH_BOUNDS(256, 1) void k_diag1_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 1>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_diag2_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 2>(V2_PASS); }
@@ -709,4 +764,10 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_diag15_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_
 KERNEL LAUNCH_BOUNDS(256, 1) void k_diag8_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 8>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2b_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_C>(V2_PASS); }
+#endif
+#if defined(PRL_EMU) || (PRL_MMA && defined(K_V2_8))
+// tile 8: 512 threads, warp tile 32x64 (2 x 8 sub-tiles) -> half the B-fragment smem traffic of v3 nt16
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v3a_nt8(FMINE_ARGS) { mine_v2<2, 8, V3N8_A>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v3b_nt8(FMINE_ARGS) { mine_v2<2, 8, V3N8_B>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v3c_nt8(FMINE_ARGS) { mine_v2<2, 8, V3N8_C>(V2_PASS); }
 #endif

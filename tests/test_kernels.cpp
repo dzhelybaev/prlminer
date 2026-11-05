@@ -171,6 +171,10 @@ int main() {
         }
         test_mine("k_v3a_nt16", nullptr, 16, 128, 256, 2048, k_v3a_nt16, 131072, 512);
         test_mine("k_v3b_nt16", nullptr, 16, 128, 256, 2048, k_v3b_nt16, 131072, 512);
+        test_mine("k_v4a_nt16", nullptr, 16, 128, 256, 2048, k_v4a_nt16, 131072, 512);
+        test_mine("k_v4b_nt16", nullptr, 16, 128, 256, 2048, k_v4b_nt16, 131072, 512);
+        test_mine("k_v4c_nt16", nullptr, 16, 128, 256, 2048, k_v4c_nt16, 131072, 512);
+        test_mine("k_v4c_nt16 multi", nullptr, 16, 256, 512, 4096, k_v4c_nt16, 131072, 512);
         test_mine("k_v3a_nt16 multi", nullptr, 16, 256, 512, 4096, k_v3a_nt16, 131072, 512);
         test_mine("k_v2a_nt16 multi", nullptr, 16, 256, 512, 4096, k_v2a_nt16, 131072);
     }

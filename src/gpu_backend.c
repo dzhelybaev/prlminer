@@ -18,14 +18,17 @@ extern const char prl_ptx_sm75_fmma32[], prl_ptx_sm75_fmma16[], prl_ptx_sm75_fmm
 extern const char prl_ptx_sm80_v2_16[], prl_ptx_sm80_v2_32[], prl_ptx_sm75_v2_16[], prl_ptx_sm75_v2_32[];
 
 // v2 kernel variants: must match V2_A/V2_B/V2_C in cuda/kernels.cu
-typedef struct { const char *name; int mt, threads, bks, stg, jsm; } v2_variant;   // name: "v2a" ...
-static const v2_variant V2_SM80[] = {{"v2a", 0, 256, 1, 4, 9}, {"v2b", 0, 256, 2, 2, 9}, {"v2c", 0, 256, 1, 3, 0},
-                                     {"v3a", 1, 512, 1, 3, 9}, {"v3b", 1, 512, 2, 2, 9}};
-static const v2_variant V2_SM75[] = {{"v2a", 0, 256, 1, 2, 1}, {"v2b", 0, 256, 1, 2, 1}, {"v2c", 0, 256, 1, 2, 0},
-                                     {"v3a", 1, 512, 1, 2, 0}, {"v3b", 1, 512, 1, 2, 0}};
+typedef struct { const char *name; int mt, threads, bks, stg, jsm, hs; } v2_variant;   // must match kernels.cu
+static const v2_variant V2_SM80[] = {{"v2a", 0, 256, 1, 4, 9, 1}, {"v2b", 0, 256, 2, 2, 9, 1}, {"v2c", 0, 256, 1, 3, 0, 1},
+                                     {"v3a", 1, 512, 1, 3, 9, 1}, {"v3b", 1, 512, 2, 2, 9, 1},
+                                     {"v4a", 2, 512, 1, 3, 9, 2}, {"v4b", 2, 512, 1, 2, 9, 2}, {"v4c", 2, 512, 2, 2, 9, 2}};
+static const v2_variant V2_SM75[] = {{"v2a", 0, 256, 1, 2, 1, 1}, {"v2b", 0, 256, 1, 2, 1, 1}, {"v2c", 0, 256, 1, 2, 0, 1},
+                                     {"v3a", 1, 512, 1, 2, 0, 1}, {"v3b", 1, 512, 1, 2, 0, 1},
+                                     {"v4a", 2, 512, 1, 2, 1, 2}, {"v4b", 2, 512, 1, 2, 1, 2}, {"v4c", 2, 512, 1, 2, 0, 2}};
+#define NV2 8
 static unsigned v2_smem(const v2_variant *v, int nt) {
-    int mt = v->mt ? v->mt : 32 / nt, js = v->jsm < mt ? v->jsm : mt;
-    return (unsigned)(v->stg * v->bks * 12288 + 16384 + 16384 * js * (v->threads / 256));
+    int mt = v->mt ? v->mt : 32 / nt, js = v->jsm < mt ? v->jsm : mt, owners = v->threads / v->hs;
+    return (unsigned)(v->stg * v->bks * 12288 + 16384 + 64 * js * owners + (v->hs == 2 ? 4 * mt * owners : 0));
 }
 
 static const char *ptx_turing_mma(int nt) {
@@ -70,7 +73,7 @@ struct gpu_dev {
     CUfunction f_uni, f_perm, f_apply, f_mine, f_fused;
     unsigned smem, smem_fused;
     bool mma, use_fused;
-    struct { CUfunction f; unsigned smem, threads; char name[16]; } fv[8];   // self-tested fused variants
+    struct { CUfunction f; unsigned smem, threads; char name[16]; } fv[12];   // self-tested fused variants
     unsigned threads_fused;
     int nfv;
     int m, geom;
@@ -302,7 +305,7 @@ static void add_fused(gpu_dev *d, CUmodule mod, const char *prefix, unsigned sme
     cu.FuncGetAttribute(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f);
     LOGI("GPU%d: kernel %s-nt%d (fused noise): %d registers, %d bytes local memory (spills)", d->idx, name,
          g_miner.nt, regs, lmem);
-    if (d->nfv < 8) {
+    if (d->nfv < 12) {
         d->fv[d->nfv].f = f;
         d->fv[d->nfv].smem = smem;
         d->fv[d->nfv].threads = threads;
@@ -369,8 +372,8 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
                     CUmodule m2;
                     if (!load_module(d, &m2, ptx, "v2")) {
                         const v2_variant *vt = sm80 ? V2_SM80 : V2_SM75;
-                        for (int i = 0; i < 5; i++) {
-                            if (vt[i].mt && 32 / g_miner.nt != 2) continue;   // v3 exists for nt16 only
+                        for (int i = 0; i < NV2; i++) {
+                            if (vt[i].mt && g_miner.nt != 16) continue;   // v3 / v4 exist for nt16 only
                             char fn[32];
                             snprintf(fn, sizeof fn, "k_%s_nt", vt[i].name);
                             add_fused(d, m2, fn, v2_smem(&vt[i], g_miner.nt), vt[i].name, maxsm, vt[i].threads);
