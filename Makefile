@@ -67,11 +67,19 @@ $(BUILD)/ptx/sm75_%.ptx: cuda/kernels.cu cuda/common.cuh
 	@mkdir -p $(dir $@)
 	$(CLANG) $(CUFLAGS) --cuda-gpu-arch=sm_75 -Xclang -target-feature -Xclang +ptx65 -DPRL_MMA=1 -DPRL_TURING=1 $(KDEF_$*) -o $@ $<
 
-PTX_FILES = $(patsubst %,$(BUILD)/ptx/sm80_%.ptx,$(PTX80)) $(patsubst %,$(BUILD)/ptx/sm61_%.ptx,$(PTX61)) \
+$(BUILD)/ptx/sm80b_bench.ptx: cuda/bench.cu cuda/common.cuh
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CUFLAGS) --cuda-gpu-arch=sm_80 -Xclang -target-feature -Xclang +ptx70 -DPRL_MMA=1 -o $@ $<
+$(BUILD)/ptx/sm75b_bench.ptx: cuda/bench.cu cuda/common.cuh
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CUFLAGS) --cuda-gpu-arch=sm_75 -Xclang -target-feature -Xclang +ptx65 -DPRL_MMA=1 -DPRL_TURING=1 -o $@ $<
+
+PTX_FILES = $(BUILD)/ptx/sm80b_bench.ptx $(BUILD)/ptx/sm75b_bench.ptx $(patsubst %,$(BUILD)/ptx/sm80_%.ptx,$(PTX80)) $(patsubst %,$(BUILD)/ptx/sm61_%.ptx,$(PTX61)) \
             $(patsubst %,$(BUILD)/ptx/sm75_%.ptx,$(PTX75))
 
 $(BUILD)/kernels_ptx.c: $(PTX_FILES) tools/embed.py
-	python3 tools/embed.py $@ $(foreach k,$(PTX80),prl_ptx_sm80_$(k)=$(BUILD)/ptx/sm80_$(k).ptx) \
+	python3 tools/embed.py $@ prl_ptx_sm80_bench=$(BUILD)/ptx/sm80b_bench.ptx prl_ptx_sm75_bench=$(BUILD)/ptx/sm75b_bench.ptx \
+	  $(foreach k,$(PTX80),prl_ptx_sm80_$(k)=$(BUILD)/ptx/sm80_$(k).ptx) \
 	  $(foreach k,$(PTX61),prl_ptx_sm61_$(k)=$(BUILD)/ptx/sm61_$(k).ptx) \
 	  $(foreach k,$(PTX75),prl_ptx_sm75_$(k)=$(BUILD)/ptx/sm75_$(k).ptx)
 
@@ -119,7 +127,7 @@ portable: $(BUILD)/ejjjminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.10
+VERSION = 1.0.11
 package: $(BUILD)/ejjjminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/ejjjminer
 	cp $(BUILD)/ejjjminer-portable $(BUILD)/pkg/ejjjminer/ejjjminer

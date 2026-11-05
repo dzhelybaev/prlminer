@@ -33,6 +33,7 @@ static void usage(void) {
         "      --rows N            matrix rows per attempt (default: 128 x SM count)\n"
         "      --list-devices      list GPUs and exit\n"
         "      --selftest          run the GPU self-test and exit\n"
+        "      --bench-mma         measure peak tensor-core throughput of every GPU and exit\n"
         "      --cpu               mine on the CPU reference backend (testing only, very slow)\n"
         "protocol:\n"
         "      --tile W            hash tile width / 2: 32 (official 2x64, default), 16, 8\n"
@@ -54,7 +55,7 @@ static void usage(void) {
 }
 
 enum {
-    O_KERNEL = 1000, O_FUSED, O_VARIANT, O_ROWS, O_LIST, O_SELFTEST, O_CPU, O_TILE, O_K, O_COLS, O_CERT, O_SALTH, O_APIPORT,
+    O_KERNEL = 1000, O_BENCHMMA, O_FUSED, O_VARIANT, O_ROWS, O_LIST, O_SELFTEST, O_CPU, O_TILE, O_K, O_COLS, O_CERT, O_SALTH, O_APIPORT,
     O_APIHOST, O_BENCH, O_BENCHDIFF, O_PRINT, O_LOG, O_DEBUG, O_SHARET
 };
 
@@ -64,13 +65,13 @@ int main(int argc, char **argv) {
     int npools = 0;
     const char *user = NULL, *worker = NULL, *pass = "x", *devices = NULL, *kernel = "auto", *cert = "auto";
     const char *api_host = "127.0.0.1", *logfile = NULL;
-    int rows = 0, tile = 32, k = 8192, cols = 2048, api_port = 4068, list = 0, selftest = 0, use_cpu = 0;
+    int rows = 0, tile = 32, k = 8192, cols = 2048, api_port = 4068, list = 0, selftest = 0, use_cpu = 0, bench_mma = 0;
     int salted_h = 99000, bench = 0, print_iv = 30;
     double bench_diff = 100000;
     static struct option opts[] = {
         {"pool", 1, 0, 'o'}, {"url", 1, 0, 'o'}, {"user", 1, 0, 'u'}, {"wallet", 1, 0, 'u'}, {"worker", 1, 0, 'w'},
         {"pass", 1, 0, 'p'}, {"devices", 1, 0, 'd'}, {"kernel", 1, 0, O_KERNEL}, {"fused", 1, 0, O_FUSED}, {"variant", 1, 0, O_VARIANT}, {"rows", 1, 0, O_ROWS},
-        {"list-devices", 0, 0, O_LIST}, {"selftest", 0, 0, O_SELFTEST}, {"cpu", 0, 0, O_CPU},
+        {"list-devices", 0, 0, O_LIST}, {"selftest", 0, 0, O_SELFTEST}, {"bench-mma", 0, 0, O_BENCHMMA}, {"cpu", 0, 0, O_CPU},
         {"tile", 1, 0, O_TILE}, {"k", 1, 0, O_K}, {"cols", 1, 0, O_COLS}, {"cert", 1, 0, O_CERT},
         {"salted-height", 1, 0, O_SALTH}, {"api-port", 1, 0, O_APIPORT}, {"api-host", 1, 0, O_APIHOST},
         {"benchmark", 1, 0, O_BENCH}, {"bench-diff", 1, 0, O_BENCHDIFF}, {"print-interval", 1, 0, O_PRINT},
@@ -92,6 +93,7 @@ int main(int argc, char **argv) {
         case O_ROWS: rows = atoi(optarg); break;
         case O_LIST: list = 1; break;
         case O_SELFTEST: selftest = 1; break;
+        case O_BENCHMMA: bench_mma = 1; break;
         case O_CPU: use_cpu = 1; break;
         case O_TILE: tile = atoi(optarg); break;
         case O_K: k = atoi(optarg); break;
@@ -125,6 +127,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!use_cpu && ngpu <= 0) { LOGE("no NVIDIA GPUs available: %s", ngpu < 0 ? err : "none found"); return 2; }
+    if (bench_mma) {
+        LOGI("ejjjminer %s — tensor-core micro-benchmark", PRL_VERSION);
+        for (int i = 0; i < ngpu; i++) gpu_bench_mma(i, &gpus[i]);
+        return 0;
+    }
     if (!selftest && !bench && (!npools || !user)) { usage(); fprintf(stderr, "\n-o and -u are required\n"); return 1; }
 
     LOGI("ejjjminer %s — pearlhash, no dev fee, no telemetry", PRL_VERSION);

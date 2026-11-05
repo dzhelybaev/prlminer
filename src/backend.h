@@ -14,6 +14,7 @@ typedef struct {
 typedef struct gpu_dev gpu_dev;
 
 int gpu_list(gpu_info *out, int cap, char *err, int errlen);   // number of GPUs or -1
+void gpu_bench_mma(int idx, const gpu_info *info);              // --bench-mma
 // Creates the context, JIT-loads the kernels and runs the self-test. kernel: "auto"|"mma"|"dp4a".
 // rows: 0 = auto. Registers the geometry with the miner. NULL if the device can't mine.
 gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int rows);

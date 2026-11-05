@@ -135,6 +135,64 @@ static CUresult launch(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsig
     return launch_t(d, f, gx, gy, 256, smem, args);
 }
 
+// ------------------------------------------------------------------ --bench-mma
+extern const char prl_ptx_sm80_bench[], prl_ptx_sm75_bench[];
+void gpu_bench_mma(int idx, const gpu_info *info) {
+    int cc = info->cc_major * 10 + info->cc_minor;
+    if (cc < 75) { LOGW("GPU%d %s: no tensor cores (cc %d.%d)", idx, info->name, info->cc_major, info->cc_minor); return; }
+    gpu_dev dd = {0}, *d = &dd;
+    d->idx = idx;
+    CUdevice dv;
+    CUmodule mod;
+    CUfunction f[2];
+    CUdeviceptr out = 0;
+    CUevent e0, e1;
+    CK(cu.DeviceGet(&dv, info->ordinal));
+    CK(cu.CtxCreate(&d->ctx, CU_CTX_SCHED_BLOCKING_SYNC, dv));
+    CK(cu.StreamCreate(&d->st, 0));
+    if (load_module(d, &mod, cc >= 80 ? prl_ptx_sm80_bench : prl_ptx_sm75_bench, "bench")) goto fail;
+    CK(cu.ModuleGetFunction(&f[0], mod, "k_peak_s8"));
+    CK(cu.ModuleGetFunction(&f[1], mod, "k_peak_s4"));
+    CK(cu.MemAlloc(&out, 64));
+    CK(cu.EventCreate(&e0, 0));
+    CK(cu.EventCreate(&e1, 0));
+    LOGI("GPU%d: %s, %d SMs, cc %d.%d — peak mma TH/s for (warps per block)x(blocks per SM):", idx,
+         info->name, info->sms, info->cc_major, info->cc_minor);
+    static const char *kname[2] = {"s8 (mining)", "s4"};
+    for (int kind = 0; kind < 2; kind++) {
+        char line[512];
+        int pos = snprintf(line, sizeof line, "GPU%d %-12s", idx, kname[kind]);
+        static const unsigned TH[] = {128, 256, 512, 1024};
+        static const unsigned BPS[] = {1, 2};
+        for (int ti = 0; ti < 4; ti++)
+            for (int bi = 0; bi < 2; bi++) {
+                unsigned threads = TH[ti], bps = BPS[bi], grid = (unsigned)info->sms * bps;
+                if (threads * bps > 1024 && cc < 80) continue;
+                if (threads * bps > 1536) continue;
+                unsigned iters = 64;
+                float ms = 0;
+                for (int rep = 0; rep < 4; rep++) {
+                    void *args[] = {&iters, &out};
+                    CK(cu.EventRecord(e0, d->st));
+                    CK(launch_t(d, f[kind], grid, 1, threads, 0, args));
+                    CK(cu.EventRecord(e1, d->st));
+                    CK(cu.EventSynchronize(e1));
+                    cu.EventElapsedTime(&ms, e0, e1);
+                    if (ms <= 0) break;
+                    if (ms < 20) iters = (unsigned)(iters * (30.0 / ms)) + 1;   // grow to ~30 ms
+                    else break;
+                }
+                double macs = (double)grid * (threads / 32) * iters * 8 * (kind ? 8192.0 : 4096.0);
+                double t = ms > 0 ? macs / (ms * 1e-3) / 1e12 : 0;
+                pos += snprintf(line + pos, sizeof line - pos, " | %2ux%u: %6.2f", threads / 32, bps, t);
+            }
+        LOGI("%s", line);
+    }
+fail:
+    if (out) cu.MemFree(out);
+    if (d->ctx) cu.CtxDestroy(d->ctx);
+}
+
 // ------------------------------------------------------------------ device-side primitives
 typedef struct {
     CUdeviceptr base, uni, pairs, out, seed;
