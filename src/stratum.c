@@ -8,6 +8,7 @@
 #include "json.h"
 #include "log.h"
 #include "miner.h"
+#include "gz.h"
 
 #include <errno.h>
 #include <netdb.h>
@@ -30,6 +31,7 @@ static volatile int g_quit, g_connected;
 static uint64_t g_gen;
 static int g_next_id = 10;
 static double g_ping_ms;
+static volatile int g_gzip;   // pool accepted "type":"v2" (gzip-compressed proofs)
 
 #define PEND 512
 static struct { int id, dev; double t; } g_pend[PEND];
@@ -189,7 +191,11 @@ static void handle_line(const char *line, uint64_t gen) {
     parse_error(err, &code, msg, sizeof msg);
     bool ok = res && ((res->t == J_BOOL && res->b) || res->t == J_OBJ || (res->t == J_STR)) && (!err || err->t == J_NULL);
     if (id == 1) {
-        if (ok) LOGI("authorized on %s as %s%s%s", stratum_pool(), g_wallet, g_worker[0] ? "." : "", g_worker);
+        const char *ty = json_str(json_get(v, "type"));
+        if (!ty && res && res->t == J_OBJ) ty = json_str(json_get(res, "type"));
+        g_gzip = ty && !strcmp(ty, "v2");
+        if (ok) LOGI("authorized on %s as %s%s%s%s", stratum_pool(), g_wallet, g_worker[0] ? "." : "", g_worker,
+                     g_gzip ? " (gzip proofs)" : "");
         else LOGE("authorization failed: code %d %s", code, msg);
         json_free(v);
         return;
@@ -232,6 +238,7 @@ static void *stratum_main(void *arg) {
         pthread_mutex_unlock(&g_send_mu);
         uint64_t gen = __atomic_add_fetch(&g_gen, 1, __ATOMIC_RELEASE);
         g_connected = 1;
+        g_gzip = 0;
         snprintf(g_miner.pool_url, sizeof g_miner.pool_url, "%s", stratum_pool());
         // authorize (login may be "wallet.worker")
         char wallet[256], worker[128];
@@ -248,7 +255,7 @@ static void *stratum_main(void *arg) {
         json_escape(ep2, sizeof ep2, g_pass);
         snprintf(msg, sizeof msg,
                  "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"mining.authorize\",\"params\":{\"wallet\":%s,\"worker\":%s,"
-                 "\"pass\":%s,\"agent\":\"" PRL_AGENT "\"}}\n",
+                 "\"pass\":%s,\"agent\":\"" PRL_AGENT "\",\"type\":\"v2\"}}\n",
                  ew, ek, ep2);
         send_all(msg, strlen(msg));
         size_t len = 0;
@@ -299,9 +306,16 @@ static void *stratum_main(void *arg) {
     return NULL;
 }
 
-int stratum_submit(const char *job_id, const char *b64, int dev) {
+int stratum_submit(const char *job_id, const uint8_t *proof, size_t plen, int dev) {
     char eid[600];
     json_escape(eid, sizeof eid, job_id);
+    uint8_t *gz = NULL;
+    size_t glen = 0;
+    if (g_gzip) gz = prl_gzip(proof, plen, &glen);
+    char *b64 = gz ? prl_base64(gz, glen) : prl_base64(proof, plen);
+    free(gz);
+    if (!b64) return -1;
+    if (g_gzip) LOGD("proof %zu bytes, gzip %zu bytes", plen, glen);
     int id;
     pthread_mutex_lock(&g_pend_mu);
     id = ++g_next_id;
@@ -313,12 +327,13 @@ int stratum_submit(const char *job_id, const char *b64, int dev) {
     pthread_mutex_unlock(&g_pend_mu);
     size_t bl = strlen(b64), cap = bl + 1024;
     char *m = malloc(cap);
-    if (!m) return -1;
+    if (!m) { free(b64); return -1; }
     int n = snprintf(m, cap, "{\"id\":%d,\"jsonrpc\":\"2.0\",\"method\":\"mining.submit\",\"params\":{\"job_id\":%s,\"plain_proof\":\"",
                      id, eid);
     memcpy(m + n, b64, bl);
     n += (int)bl;
     n += snprintf(m + n, cap - n, "\"}}\n");
+    free(b64);
     int rc = send_all(m, (size_t)n);
     free(m);
     if (rc) LOGW("failed to send share to pool");

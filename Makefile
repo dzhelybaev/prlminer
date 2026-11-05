@@ -14,7 +14,7 @@ B3ASM   = $(B3DIR)/blake3_sse2_x86-64_unix.S $(B3DIR)/blake3_sse41_x86-64_unix.S
 
 CORE    = src/pearl.c
 HOST    = src/main.c src/json.c src/stratum.c src/miner.c src/cpu_backend.c src/gpu_backend.c \
-          src/cuda_drv.c src/api.c src/log.c
+          src/cuda_drv.c src/api.c src/log.c src/gz.c
 
 BUILD   = build
 OBJ_B3  = $(patsubst %.c,$(BUILD)/%.o,$(B3SRC)) $(patsubst %.S,$(BUILD)/%.o,$(B3ASM))
@@ -106,7 +106,7 @@ portable: $(BUILD)/prlminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.2
+VERSION = 1.0.3
 package: $(BUILD)/prlminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/prlminer
 	cp $(BUILD)/prlminer-portable $(BUILD)/pkg/prlminer/prlminer

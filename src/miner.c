@@ -52,14 +52,6 @@ static uint64_t rand64(void) {
     return v;
 }
 
-static void fill_matrix(uint8_t *p, size_t n, uint64_t seed) {
-    uint64_t s = seed | 1;
-    for (size_t i = 0; i < n; i++) {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-        p[i] = (uint8_t)(int8_t)((int)((s >> 24) & 127) - 64);   // [-64, 63]
-    }
-}
-
 static work_t *work_ref(work_t *w) {
     if (w) atomic_fetch_add(&w->refs, 1);
     return w;
@@ -353,22 +345,19 @@ static void process_candidate(cand_t *c) {
         prl_bytes_free(&pr);
         return;
     }
-    char *b64 = prl_base64(pr.buf, pr.len);
     size_t blen = pr.len;
-    prl_bytes_free(&pr);
-    if (!b64) return;
     if (g_benchmark) {
         atomic_fetch_add(&M->dev[c->dev].accepted, 1);
         unsigned a = atomic_fetch_add(&M->shares_accepted, 1) + 1;
         LOGI("%s: share verified locally (benchmark, not submitted) [%u]", M->dev[c->dev].tag, a);
-        free(b64);
+        prl_bytes_free(&pr);
         return;
     }
     if (stratum_conn_gen() != j->conn_gen) {
         atomic_fetch_add(&M->dev[c->dev].stale, 1);
         atomic_fetch_add(&M->shares_stale, 1);
         LOGW("%s: share for a previous connection dropped", M->dev[c->dev].tag);
-        free(b64);
+        prl_bytes_free(&pr);
         return;
     }
     pthread_mutex_lock(&M->mu);
@@ -378,12 +367,12 @@ static void process_candidate(cand_t *c) {
         atomic_fetch_add(&M->dev[c->dev].stale, 1);
         atomic_fetch_add(&M->shares_stale, 1);
         LOGI("%s: share for old block %u dropped", M->dev[c->dev].tag, j->height);
-        free(b64);
+        prl_bytes_free(&pr);
         return;
     }
     LOGI("%s: share found (job %s, tile %u/%u, %zu bytes), submitting", M->dev[c->dev].tag, j->id, c->tr, c->tc, blen);
-    stratum_submit(j->id, b64, c->dev);
-    free(b64);
+    stratum_submit(j->id, pr.buf, pr.len, c->dev);
+    prl_bytes_free(&pr);
 }
 
 static void *share_main(void *arg) {
@@ -432,9 +421,10 @@ int miner_start(void) {
     M->A_base = malloc(asz);
     M->Bt_base = malloc(bsz);
     if (!M->A_base || !M->Bt_base) { LOGE("out of memory for base matrices"); return -1; }
-    uint64_t seed = rand64();
-    fill_matrix(M->A_base, asz, seed);
-    fill_matrix(M->Bt_base, bsz, seed ^ 0xA5A5A5A5DEADBEEFULL);
+    // Base matrices are all zero (only the nonce nibbles in A differ). The noise makes the
+    // GEMM operands random anyway, and zero leaves make PlainProofs compress ~100x.
+    memset(M->A_base, 0, asz);
+    memset(M->Bt_base, 0, bsz);
     if (pthread_create(&g_prep_th, NULL, prep_main, NULL)) return -1;
     if (pthread_create(&g_share_th, NULL, share_main, NULL)) return -1;
     g_threads_started = 1;

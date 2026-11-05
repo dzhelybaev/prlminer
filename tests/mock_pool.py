@@ -4,6 +4,8 @@ Every submitted share is verified with the independent Python verifier (pyverify
 usage: mock_pool.py PORT DIFF SHARES [--salted 0|1] [--height H]
 Exits 0 after SHARES valid shares (switching to a new block halfway), 1 on any invalid share."""
 import argparse
+import base64
+import gzip
 import json
 import os
 import socket
@@ -19,6 +21,7 @@ ap.add_argument("diff", type=float)
 ap.add_argument("shares", type=int)
 ap.add_argument("--height", type=int, default=120000)
 ap.add_argument("--timeout", type=float, default=600)
+ap.add_argument("--nogzip", action="store_true")
 args = ap.parse_args()
 salted = args.height >= 99000
 
@@ -63,8 +66,12 @@ while True:
     if meth == "mining.authorize":
         assert isinstance(params, dict) and params.get("wallet"), params
         print(f"[pool] authorize wallet={params['wallet']} worker={params.get('worker')} agent={params.get('agent')}", flush=True)
+        gz = params.get("type") == "v2" and not args.nogzip
         cur = new_job(0)
-        send({"id": msg["id"], "result": True, "error": None})
+        reply = {"id": msg["id"], "result": True, "error": None}
+        if gz:
+            reply["type"] = "v2"
+        send(reply)
     elif meth == "mining.submit":
         jid, b64 = params["job_id"], params["plain_proof"]
         if jid not in jobs or jid != cur:
@@ -73,8 +80,11 @@ while True:
             print(f"[pool] stale share for {jid}", flush=True)
             continue
         ts = time.time()
-        ok, why, hv = pyverify.verify_b64(b64, jobs[jid], salted, target)
-        print(f"[pool] share job={jid} {len(b64)}B -> {why} (verified in {time.time() - ts:.1f}s)", flush=True)
+        raw = base64.b64decode(b64)
+        if gz:
+            raw = gzip.decompress(raw)
+        ok, why, hv = pyverify.verify(raw, jobs[jid], salted, target)
+        print(f"[pool] share job={jid} {len(b64)}B b64 (proof {len(raw)}B, gzip={gz}) -> {why} (verified in {time.time() - ts:.1f}s)", flush=True)
         if ok:
             good += 1
             send({"id": msg["id"], "result": True, "error": None})
