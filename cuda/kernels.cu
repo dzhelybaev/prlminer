@@ -346,6 +346,285 @@ DEVINL void mine_body(const i8 *A, const i8 *U, const u8 *P, u32 nlo, u32 nhi, c
     }
 }
 
+// ===================================================================== v2 mining kernel (fused only)
+// Same hash-tile geometry and results as mine_body<..., FUSED=true>, restructured for throughput:
+//  * 32-byte smem rows (A and B) with a 16-byte-chunk XOR swizzle: conflict-free ldmatrix,
+//    cp.async and noise-generation stores, no padding;
+//  * ldmatrix.x4 fragment loads (A: 1 per m16 sub-tile, B: 1 per pair of n8 sub-tiles);
+//  * the transcript fold of chunk c is interleaved with the first mma's of chunk c+1
+//    (no tensor-pipe drain every 128 k);
+//  * JPS: transcript words in shared memory (frees 16*MT registers);
+//  * BKS k32-slices per pipeline stage (fewer barriers), STG stages;
+//  * without cp.async (Turing) the B tile is prefetched through registers one stage ahead.
+#define V2_SLICE_A (BM * 32)
+#define V2_SLICE_B (BN * 32)
+#define V2_SLICE (V2_SLICE_A + V2_SLICE_B)
+#if defined(PRL_EMU)
+#if defined(PRL_TURING)
+#define V2_ASYNC 0
+#else
+#define V2_ASYNC 1
+#endif
+#elif PRL_MMA && !PRL_TURING
+#define V2_ASYNC 1
+#else
+#define V2_ASYNC 0
+#endif
+#if defined(PRL_EMU)
+DEVINL void ldg128(u32 r[4], const void *p) { __builtin_memcpy(r, p, 16); }
+DEVINL void sts128(void *p, const u32 r[4]) { __builtin_memcpy(p, r, 16); }
+#else
+DEVINL void ldg128(u32 r[4], const void *p) {
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "l"(p));
+}
+DEVINL void sts128(void *p, const u32 r[4]) {
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(smem_addr(p)), "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3])
+                 : "memory");
+}
+#endif
+
+// byte offset of 16-byte chunk c (0/1) of row r: groups of 4 rows form 8 chunks, XOR-swizzled by group
+DEVINL u32 v2_off(u32 r, u32 c) { return (r >> 2) * 128u + 16u * ((2u * (r & 3u) + c) ^ ((r >> 2) & 7u)); }
+
+template <int MT, int NT, int BKS, int STG, bool JPS>
+DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k,
+                    const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
+    constexpr int WARPS_N = BN / (8 * NT);
+    constexpr u32 STAGE = BKS * V2_SLICE;
+    DYN_SMEM(smem);
+    const u32 tid = TID_X, lane = tid & 31, warp = tid >> 5;
+    const u32 g = lane >> 2, q = lane & 3;
+    const u32 wm = warp / WARPS_N, wn = warp % WARPS_N;
+    const u32 row0 = BID_Y * BM, col0 = BID_X * BN;
+    const u32 wrow = wm * 16 * MT, wcol = wn * 8 * NT;
+    u32 *ELt = (u32 *)(smem + STG * STAGE);
+    u32 *jps = ELt + 128 * 32;   // JPS: word w, sub-tile a of thread t at [(w*MT + a)*256 + t]
+
+    i32 acc[MT][NT][4];
+    u32 jpr[JPS ? 1 : MT][16];
+#pragma unroll
+    for (int a = 0; a < MT; a++) {
+#pragma unroll
+        for (int b = 0; b < NT; b++) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0;
+        if constexpr (!JPS) {
+#pragma unroll
+            for (int j = 0; j < 16; j++) jpr[a][j] = 0;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; j++) jps[(j * MT + a) * 256 + tid] = 0;
+        }
+    }
+    const u32 *P32 = (const u32 *)P;
+    u32 pw0, pw1, gen_kt = 0;
+    {   // stage this block's 128 uniform rows transposed: ELt[f*32 + rg] = bytes U[4rg+j][f]
+        const u32 fb = warp * 16;
+        u32 x[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const u32 *src = (const u32 *)(U + (u64)(row0 + 4 * lane + j) * 128 + fb);
+#pragma unroll
+            for (int w = 0; w < 4; w++) x[j][w] = src[w];
+        }
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            u32 y[4];
+            transpose4(x[0][w], x[1][w], x[2][w], x[3][w], y);
+#pragma unroll
+            for (int i = 0; i < 4; i++) ELt[(fb + 4 * w + i) * 32 + lane] = y[i];
+        }
+        pw0 = P32[2 * warp];
+        pw1 = P32[2 * warp + 1];
+        BAR_SYNC();
+    }
+    const u32 nk = k / 32, ns = nk / BKS;
+
+    // warp w generates lines 4w..4w+3 of a k32 slice for rows 4*lane..4*lane+3
+    auto gen_slice = [&](u8 *As) {
+        u32 wv[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            u32 pw = i < 2 ? pw0 : pw1;
+            u32 f = (pw >> (16 * (i & 1))) & 0xffu, sc = (pw >> (16 * (i & 1) + 8)) & 0xffu;
+            wv[i] = bsub4(ELt[f * 32 + lane], ELt[sc * 32 + lane]);
+        }
+        u32 r[4];
+        transpose4(wv[0], wv[1], wv[2], wv[3], r);
+        if (row0 == 0 && gen_kt == 0 && lane == 0 && warp < 4) {   // nonce nibbles 4w..4w+3 of row 0
+            u32 v = ((warp < 2 ? nlo : nhi) >> (16 * (warp & 1))) & 0xffffu;
+            u32 nw = (v & 15u) | ((v >> 4) & 15u) << 8 | ((v >> 8) & 15u) << 16 | ((v >> 12) & 15u) << 24;
+            r[0] = badd4(r[0], nw);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; j++) *(u32 *)(As + v2_off(4 * lane + j, warp >> 2) + 4 * (warp & 3)) = r[j];
+        gen_kt++;
+        if (gen_kt < nk) {
+            pw0 = P32[gen_kt * 16 + 2 * warp];
+            pw1 = P32[gen_kt * 16 + 2 * warp + 1];
+        }
+    };
+#if !V2_ASYNC
+    u32 breg[BKS][2][4];
+#endif
+    auto issue = [&](u32 st, u32 s) {
+        u8 *S = smem + st * STAGE;
+#pragma unroll
+        for (int j = 0; j < BKS; j++) {
+            u8 *As = S + j * V2_SLICE, *Bs = As + V2_SLICE_A;
+            const u32 ks = s * BKS + j;
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const u32 r = (tid >> 1) + 128 * i, c = tid & 1;
+                const i8 *src = Bt + (u64)(col0 + r) * k + ks * 32 + 16 * c;
+#if V2_ASYNC
+                cp_async16(Bs + v2_off(r, c), src);
+#else
+                ldg128(breg[j][i], src);
+#endif
+            }
+            gen_slice(As);
+        }
+    };
+    auto commit = [&](u32 st) {
+#if !V2_ASYNC
+        u8 *S = smem + st * STAGE;
+#pragma unroll
+        for (int j = 0; j < BKS; j++)
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const u32 r = (tid >> 1) + 128 * i, c = tid & 1;
+                sts128(S + j * V2_SLICE + V2_SLICE_A + v2_off(r, c), breg[j][i]);
+            }
+#endif
+    };
+    auto jp_update = [&](u32 chunk, const u32 *x) {
+#pragma unroll
+        for (int a = 0; a < MT; a++) {
+            if constexpr (JPS) {
+                u32 *p = jps + ((chunk & 15) * MT + a) * 256 + tid;
+                *p = rotl32(*p, 13) ^ x[a];
+            } else {
+                u32 head = rotl32(jpr[a][0], 13) ^ x[a];
+#pragma unroll
+                for (int j = 0; j < 15; j++) jpr[a][j] = jpr[a][j + 1];
+                jpr[a][15] = head;
+            }
+        }
+    };
+
+#pragma unroll
+    for (int s = 0; s < STG - 1; s++) {
+        if ((u32)s < ns) { issue(s, s); commit(s); }
+        cp_async_commit();
+    }
+    for (u32 s = 0; s < ns; s++) {
+        cp_async_wait<STG - 2>();
+        BAR_SYNC();
+        const bool pre = s + STG - 1 < ns;
+        if (pre) issue((s + STG - 1) % STG, s + STG - 1);
+        cp_async_commit();
+        const u8 *S = smem + (s % STG) * STAGE;
+#pragma unroll
+        for (int j = 0; j < BKS; j++) {
+            const u32 ks = s * BKS + j;
+            const u8 *As = S + j * V2_SLICE, *Bs = As + V2_SLICE_A;
+            const bool fold = (ks & 3) == 0 && ks > 0;
+            u32 x[MT];
+            u32 af[MT][4];
+#pragma unroll
+            for (int a = 0; a < MT; a++) {
+                x[a] = 0;
+                const u32 r = wrow + 16 * a + (lane & 7) + 8 * ((lane >> 3) & 1);
+                ldmatrix_x4(af[a], As + v2_off(r, lane >> 4));
+            }
+#pragma unroll
+            for (int bp = 0; bp < NT / 2; bp++) {
+                u32 bf[4];
+                {
+                    const u32 i = lane >> 3;
+                    const u32 r = wcol + 8 * (2 * bp + (i >> 1)) + (lane & 7);
+                    ldmatrix_x4(bf, Bs + v2_off(r, i & 1));
+                }
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int b = 2 * bp + h;
+                    const u32 bb[2] = {bf[2 * h], bf[2 * h + 1]};
+#pragma unroll
+                    for (int a = 0; a < MT; a++) {
+                        if (fold) x[a] ^= (u32)acc[a][b][0] ^ (u32)acc[a][b][1] ^ (u32)acc[a][b][2] ^ (u32)acc[a][b][3];
+                        mma_s8(acc[a][b], af[a], bb);
+                    }
+                }
+            }
+            if (fold) jp_update(ks / 4 - 1, x);
+        }
+        if (pre) commit((s + STG - 1) % STG);
+    }
+    {   // last chunk
+        u32 x[MT];
+#pragma unroll
+        for (int a = 0; a < MT; a++) {
+            x[a] = 0;
+#pragma unroll
+            for (int b = 0; b < NT; b++)
+                x[a] ^= (u32)acc[a][b][0] ^ (u32)acc[a][b][1] ^ (u32)acc[a][b][2] ^ (u32)acc[a][b][3];
+        }
+        jp_update(nk / 4 - 1, x);
+    }
+
+    u32 key[8], bound[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) { key[i] = seed8[i]; bound[i] = bound8[i]; }
+    const u32 tiles_c = n / (2 * NT);
+#pragma unroll
+    for (int a = 0; a < MT; a++) {
+        u32 words[16];
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            if constexpr (JPS) words[j] = jps[(j * MT + a) * 256 + tid];
+            else words[j] = jpr[a][j];
+        }
+        u32 t_rows = row0 + wrow + 16 * a + g;
+        u32 t_cols = col0 + wcol + 2 * q;
+        if (dbg) {
+            u32 rid = (t_rows / 16) * 8 + (t_rows % 16);
+            u32 cid = (t_cols / (8 * NT)) * 4 + (t_cols % (8 * NT)) / 2;
+            u32 *d = dbg + ((u64)rid * tiles_c + cid) * 16;
+#pragma unroll
+            for (int j = 0; j < 16; j++) d[j] = words[j];
+        }
+        u32 h[8];
+        b3_keyed64(key, words, h);
+        int le = 1;
+        bool ok = false;
+#pragma unroll
+        for (int i = 7; i >= 0; i--) {
+            if (le) {
+                if (h[i] < bound[i]) { ok = true; le = 0; }
+                else if (h[i] > bound[i]) { ok = false; le = 0; }
+            }
+        }
+        if (le) ok = true;
+        if (ok) {
+            u32 slot = atomic_add_u32(cand, 1u);
+            if (slot < cand_cap) {
+                u32 *c = cand + 4 + NCAND_WORDS * slot;
+                c[0] = t_rows; c[1] = t_cols; c[2] = h[7]; c[3] = h[6];
+            }
+        }
+    }
+}
+
+// variants (host computes smem = STG*BKS*V2_SLICE + 16384 + (JPS ? 16384*MT : 0))
+#if V2_ASYNC
+#define V2_A 1, 4, true
+#define V2_B 2, 2, true
+#define V2_C 1, 3, false
+#else
+#define V2_A 1, 2, false
+#define V2_B 2, 2, false
+#define V2_C 1, 2, false
+#endif
+
 #define MINE_ARGS const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 *seed8, const u32 *bound8, \
                   u32 *cand, u32 cand_cap, u32 *dbg
 #define MINE_PASS A, nullptr, nullptr, 0u, 0u, Bt, m, n, k, seed8, bound8, cand, cand_cap, dbg
@@ -379,4 +658,15 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt16(MINE_ARGS) { mine_body<2, 16,
 #endif
 #if defined(PRL_EMU) || defined(K_DP4A8)
 KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt8(MINE_ARGS)  { mine_body<4, 8, false, false>(MINE_PASS); }
+#endif
+#define V2_PASS U, P, nlo, nhi, Bt, m, n, k, seed8, bound8, cand, cand_cap, dbg
+#if defined(PRL_EMU) || (PRL_MMA && defined(K_V2_32))
+KERNEL LAUNCH_BOUNDS(256, 1) void k_v2a_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_A>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_v2b_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_B>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_C>(V2_PASS); }
+#endif
+#if defined(PRL_EMU) || (PRL_MMA && defined(K_V2_16))
+KERNEL LAUNCH_BOUNDS(256, 1) void k_v2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_v2b_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_C>(V2_PASS); }
 #endif

@@ -11,6 +11,7 @@
 
 struct WarpScratch {
     u32 a[32][4], b[32][2];
+    const u8 *p[32];
     pthread_barrier_t bar;
 };
 
@@ -76,6 +77,17 @@ void emu_mma_m8n8k16(i32 *d, u32 a, u32 b) {
         for (int kk = 0; kk < 16; kk++) s += (int32_t)A[g][kk] * (int32_t)B[kk][2 * q + e];
         d[e] += s;
     }
+}
+
+// ldmatrix .x4 (b16 view): lane L supplies the row address of matrix L/8, row L%8 (16 bytes);
+// lane L receives, for each matrix i, bytes 4*(L%4)..+3 of row L/4.
+void emu_ldmatrix_x4(u32 out[4], const void *row_addr) {
+    WarpScratch &w = g_warps[t_tid / 32];
+    u32 lane = t_tid & 31;
+    w.p[lane] = (const u8 *)row_addr;
+    pthread_barrier_wait(&w.bar);
+    for (int i = 0; i < 4; i++) memcpy(&out[i], w.p[8 * i + lane / 4] + 4 * (lane % 4), 4);
+    pthread_barrier_wait(&w.bar);
 }
 
 struct ThreadArg {

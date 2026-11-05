@@ -70,7 +70,7 @@ static void test_noise() {
     printf("noise kernels ok\n");
 }
 
-static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k, fmine_fn ffn = nullptr) {
+static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k, fmine_fn ffn = nullptr, u32 fsmem = 0) {
     std::vector<i8> A(m * k), Bt(n * k), U(m * 128);
     std::vector<u8> P(2 * k);
     const uint64_t nonce = 0x0123456789abcdefULL ^ ((uint64_t)m << 40);
@@ -126,7 +126,7 @@ static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k,
     u256_from_le_bytes(&bound, le.data());
     std::vector<u32> dbg(ntiles * 16, 0xdeadbeef), cand(4 + 4 * 64, 0);
     if (ffn)
-        emu_launch(n / BN, m / BM, NTHREADS, STAGES * STAGE_BYTES + FUSED_SMEM, [&]() {
+        emu_launch(n / BN, m / BM, NTHREADS, fsmem ? fsmem : STAGES * STAGE_BYTES + FUSED_SMEM, [&]() {
             ffn(U.data(), P.data(), (u32)nonce, (u32)(nonce >> 32), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64,
                 dbg.data());
         });
@@ -158,6 +158,18 @@ int main() {
     test_mine("k_mine_fmma_nt32", nullptr, 32, 128, 256, 2048, k_mine_fmma_nt32);
     test_mine("k_mine_fmma_nt16", nullptr, 16, 256, 256, 2048, k_mine_fmma_nt16);
     test_mine("k_mine_fmma_nt8", nullptr, 8, 128, 512, 4096, k_mine_fmma_nt8);
+    {
+        struct V { const char *name; fmine_fn f; int nt, mt, bks, stg, jps; } vs[] = {
+#define VV(nm, f, nt, mt, ...) {nm, f, nt, mt, __VA_ARGS__}
+            VV("k_v2a_nt16", k_v2a_nt16, 16, 2, V2_A), VV("k_v2b_nt16", k_v2b_nt16, 16, 2, V2_B),
+            VV("k_v2c_nt16", k_v2c_nt16, 16, 2, V2_C), VV("k_v2a_nt32", k_v2a_nt32, 32, 1, V2_A),
+            VV("k_v2b_nt32", k_v2b_nt32, 32, 1, V2_B), VV("k_v2c_nt32", k_v2c_nt32, 32, 1, V2_C)};
+        for (auto &v : vs) {
+            u32 sm = v.stg * v.bks * V2_SLICE + 16384 + (v.jps ? 16384 * v.mt : 0);
+            test_mine(v.name, nullptr, v.nt, 128, 256, 2048, v.f, sm);
+        }
+        test_mine("k_v2b_nt16 multi", nullptr, 16, 256, 512, 4096, k_v2b_nt16, 2 * 2 * V2_SLICE + 16384 + (V2_ASYNC ? 32768 : 0));
+    }
     if (fails) { printf("%d FAILURES\n", fails); return 1; }
     printf("ALL KERNEL EMULATION TESTS PASSED\n");
     return 0;

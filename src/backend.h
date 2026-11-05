@@ -25,4 +25,5 @@ cpu_dev *cpu_prepare(int stat_idx, int threads, int rows);
 int cpu_launch(cpu_dev *d);
 
 extern volatile int g_benchmark;
+extern const char *g_variant;   // force a fused kernel variant by name (fmma, v2a, v2b, v2c), NULL = autotune
 extern int g_fused_mode;   // 0 auto (profile and pick the faster), 1 always fused, -1 never

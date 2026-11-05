@@ -47,6 +47,14 @@ template <int N> DEVINL void cp_async_wait() {}
 #endif
 
 DEVINL u32 atomic_add_u32(u32 *p, u32 v) { return (u32)__nvvm_atom_add_gen_i((int *)p, (int)v); }
+#if PRL_MMA
+DEVINL void ldmatrix_x4(u32 r[4], const void *p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
+}
+#else
+DEVINL void ldmatrix_x4(u32 r[4], const void *p) { __builtin_trap(); }
+#endif
 DEVINL u32 byte_perm(u32 a, u32 b, u32 s) {
     u32 d;
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s));
@@ -102,6 +110,7 @@ DEVINL void cp_async16(void *dst, const void *src) { __builtin_memcpy(dst, src, 
 DEVINL void cp_async_commit() {}
 template <int N> DEVINL void cp_async_wait() {}
 DEVINL u32 atomic_add_u32(u32 *p, u32 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+DEVINL void ldmatrix_x4(u32 r[4], const void *p) { emu_ldmatrix_x4(r, p); }
 DEVINL u32 byte_perm(u32 a, u32 b, u32 s) {
     u64 x = (u64)a | ((u64)b << 32);
     u32 r = 0;

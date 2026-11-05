@@ -34,4 +34,6 @@ echo "== end-to-end: CPU backend -> mock pool (independent Python verifier)"
 e2e cpu 34101 0.01 ./build/ejjjminer-portable --cpu
 echo "== end-to-end: GPU backend (emulated) -> mock pool"
 LD_LIBRARY_PATH=build/fakecuda e2e gpu 34102 0.05 ./build/ejjjminer-portable --rows 128
+echo "== end-to-end: v2 fused kernel (emulated) -> mock pool"
+LD_LIBRARY_PATH=build/fakecuda e2e gpu_v2 34103 0.05 ./build/ejjjminer-portable --rows 128 --tile 16 --variant v2b
 echo "ALL TESTS PASSED"
