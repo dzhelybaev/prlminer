@@ -388,7 +388,8 @@ DEVINL void sts128(void *p, const u32 r[4]) {
 // linear in steps of 16 rows (+512 bytes), so per-sub-tile addresses become instruction immediates.
 DEVINL u32 v2_off(u32 r, u32 c) { return (r >> 2) * 128u + 16u * ((2u * (r & 3u) + c) ^ ((r >> 2) & 3u)); }
 
-template <int MT, int NT, int BKS, int STG, int JSM, bool PF>
+// DIAG (benchmark only, results are wrong): 1 no noise generation, 2 no B loads, 4 no barriers, 8 no fold
+template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0>
 DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k,
                     const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
     constexpr int WARPS_N = BN / (8 * NT);
@@ -482,6 +483,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
 #pragma unroll
             for (int i = 0; i < CPI; i++) {
                 const i8 *src = bsrc + (u64)(NTH / 2) * i * k + ks * 32;
+                if constexpr (DIAG & 2) continue;
 #if V2_ASYNC
                 cp_async16s(As + c_st + 16 * NTH * i, src);
 #else
@@ -493,7 +495,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
                 }
 #endif
             }
-            if (warp < 8) gen_slice(As);   // 8 warps generate (spread evenly over the 4 schedulers)
+            if (!(DIAG & 1) && warp < 8) gen_slice(As);   // 8 warps generate (spread evenly over the 4 schedulers)
         }
     };
     auto commit = [&](u32 st) {
@@ -526,18 +528,26 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         if ((u32)s < ns) { issue(s, s); commit(s); }
         cp_async_commit();
     }
-    for (u32 s = 0; s < ns; s++) {
-        cp_async_wait<STG - 2>();
-        BAR_SYNC();
-        const bool pre = s + STG - 1 < ns;
-        if (pre) issue((s + STG - 1) % STG, s + STG - 1);
+    // Branch-free steady state: G stages (= one 128-wide chunk) per iteration, stage indices and fold
+    // positions are compile-time, so the scheduler can interleave noise generation / copies with the mma's.
+    // (The fold at k=0 is a no-op on all-zero state.)
+    constexpr int G = 4 / BKS;
+    auto step = [&](u32 s0, int g, bool do_issue) __attribute__((always_inline)) {
+        const u32 s = s0 + g;
+        if constexpr (!(DIAG & 4)) {
+            cp_async_wait<STG - 2>();
+            BAR_SYNC();
+        }
+        const u32 st_c = (G % STG == 0) ? (u32)(g % STG) : s % STG;
+        const u32 st_i = (G % STG == 0) ? (u32)((g + STG - 1) % STG) : (s + STG - 1) % STG;
+        if (do_issue) issue(st_i, s + STG - 1);
         cp_async_commit();
-        const saddr_t S = sb + (s % STG) * STAGE;
+        const saddr_t S = sb + st_c * STAGE;
 #pragma unroll
         for (int j = 0; j < BKS; j++) {
             const u32 ks = s * BKS + j;
             const saddr_t Sl = S + j * V2_SLICE;
-            const bool fold = (ks & 3) == 0 && ks > 0;
+            const bool fold = !(DIAG & 8) && ((g * BKS + j) & 3) == 0;
             u32 x[MT];
             u32 af[MT][4];
 #pragma unroll
@@ -562,7 +572,17 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
             }
             if (fold) jp_update(ks / 4 - 1, x);
         }
-        if (pre) commit((s + STG - 1) % STG);
+        if (do_issue) commit(st_i);
+    };
+    const u32 ns_safe = ns >= (u32)(STG - 1) ? ns - (STG - 1) : 0;
+    u32 s0 = 0;
+    for (; s0 + G <= ns_safe; s0 += G) {
+#pragma unroll
+        for (int g = 0; g < G; g++) step(s0, g, true);
+    }
+    for (; s0 < ns; s0 += G) {
+#pragma unroll
+        for (int g = 0; g < G; g++) step(s0, g, s0 + g < ns_safe);
     }
     {   // last chunk
         u32 x[MT];
@@ -680,6 +700,13 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_C>(
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v3a_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v3b_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A>(V2_PASS); }
+// --bench-mma breakdown of v2b (wrong results by design)
+KERNEL LAUNCH_BOUNDS(256, 1) void k_diag1_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 1>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_diag2_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 2>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_diag3_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 3>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_diag7_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 7>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_diag15_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 15>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_diag8_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 8>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2b_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_C>(V2_PASS); }
 #endif

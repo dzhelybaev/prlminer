@@ -135,64 +135,6 @@ static CUresult launch(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsig
     return launch_t(d, f, gx, gy, 256, smem, args);
 }
 
-// ------------------------------------------------------------------ --bench-mma
-extern const char prl_ptx_sm80_bench[], prl_ptx_sm75_bench[];
-void gpu_bench_mma(int idx, const gpu_info *info) {
-    int cc = info->cc_major * 10 + info->cc_minor;
-    if (cc < 75) { LOGW("GPU%d %s: no tensor cores (cc %d.%d)", idx, info->name, info->cc_major, info->cc_minor); return; }
-    gpu_dev dd = {0}, *d = &dd;
-    d->idx = idx;
-    CUdevice dv;
-    CUmodule mod;
-    CUfunction f[2];
-    CUdeviceptr out = 0;
-    CUevent e0, e1;
-    CK(cu.DeviceGet(&dv, info->ordinal));
-    CK(cu.CtxCreate(&d->ctx, CU_CTX_SCHED_BLOCKING_SYNC, dv));
-    CK(cu.StreamCreate(&d->st, 0));
-    if (load_module(d, &mod, cc >= 80 ? prl_ptx_sm80_bench : prl_ptx_sm75_bench, "bench")) goto fail;
-    CK(cu.ModuleGetFunction(&f[0], mod, "k_peak_s8"));
-    CK(cu.ModuleGetFunction(&f[1], mod, "k_peak_s4"));
-    CK(cu.MemAlloc(&out, 64));
-    CK(cu.EventCreate(&e0, 0));
-    CK(cu.EventCreate(&e1, 0));
-    LOGI("GPU%d: %s, %d SMs, cc %d.%d — peak mma TH/s for (warps per block)x(blocks per SM):", idx,
-         info->name, info->sms, info->cc_major, info->cc_minor);
-    static const char *kname[2] = {"s8 (mining)", "s4"};
-    for (int kind = 0; kind < 2; kind++) {
-        char line[512];
-        int pos = snprintf(line, sizeof line, "GPU%d %-12s", idx, kname[kind]);
-        static const unsigned TH[] = {128, 256, 512, 1024};
-        static const unsigned BPS[] = {1, 2};
-        for (int ti = 0; ti < 4; ti++)
-            for (int bi = 0; bi < 2; bi++) {
-                unsigned threads = TH[ti], bps = BPS[bi], grid = (unsigned)info->sms * bps;
-                if (threads * bps > 1024 && cc < 80) continue;
-                if (threads * bps > 1536) continue;
-                unsigned iters = 64;
-                float ms = 0;
-                for (int rep = 0; rep < 4; rep++) {
-                    void *args[] = {&iters, &out};
-                    CK(cu.EventRecord(e0, d->st));
-                    CK(launch_t(d, f[kind], grid, 1, threads, 0, args));
-                    CK(cu.EventRecord(e1, d->st));
-                    CK(cu.EventSynchronize(e1));
-                    cu.EventElapsedTime(&ms, e0, e1);
-                    if (ms <= 0) break;
-                    if (ms < 20) iters = (unsigned)(iters * (30.0 / ms)) + 1;   // grow to ~30 ms
-                    else break;
-                }
-                double macs = (double)grid * (threads / 32) * iters * 8 * (kind ? 8192.0 : 4096.0);
-                double t = ms > 0 ? macs / (ms * 1e-3) / 1e12 : 0;
-                pos += snprintf(line + pos, sizeof line - pos, " | %2ux%u: %6.2f", threads / 32, bps, t);
-            }
-        LOGI("%s", line);
-    }
-fail:
-    if (out) cu.MemFree(out);
-    if (d->ctx) cu.CtxDestroy(d->ctx);
-}
-
 // ------------------------------------------------------------------ device-side primitives
 typedef struct {
     CUdeviceptr base, uni, pairs, out, seed;
@@ -662,3 +604,102 @@ int gpu_launch(gpu_dev *d) {
 void gpu_join_all(void) {
     for (int i = 0; i < g_ndevs; i++) pthread_join(g_devs[i]->th, NULL);
 }
+
+// ------------------------------------------------------------------ --bench-mma
+extern const char prl_ptx_sm80_bench[], prl_ptx_sm75_bench[];
+void gpu_bench_mma(int idx, const gpu_info *info) {
+    int cc = info->cc_major * 10 + info->cc_minor;
+    if (cc < 75) { LOGW("GPU%d %s: no tensor cores (cc %d.%d)", idx, info->name, info->cc_major, info->cc_minor); return; }
+    gpu_dev dd = {0}, *d = &dd;
+    d->idx = idx;
+    CUdevice dv;
+    CUmodule mod;
+    CUfunction f[2];
+    CUdeviceptr out = 0;
+    CUevent e0, e1;
+    CK(cu.DeviceGet(&dv, info->ordinal));
+    CK(cu.CtxCreate(&d->ctx, CU_CTX_SCHED_BLOCKING_SYNC, dv));
+    CK(cu.StreamCreate(&d->st, 0));
+    if (load_module(d, &mod, cc >= 80 ? prl_ptx_sm80_bench : prl_ptx_sm75_bench, "bench")) goto fail;
+    CK(cu.ModuleGetFunction(&f[0], mod, "k_peak_s8"));
+    CK(cu.ModuleGetFunction(&f[1], mod, "k_peak_s4"));
+    CK(cu.MemAlloc(&out, 64));
+    CK(cu.EventCreate(&e0, 0));
+    CK(cu.EventCreate(&e1, 0));
+    LOGI("GPU%d: %s, %d SMs, cc %d.%d — peak mma TH/s for (warps per block)x(blocks per SM):", idx,
+         info->name, info->sms, info->cc_major, info->cc_minor);
+    static const char *kname[2] = {"s8 (mining)", "s4"};
+    for (int kind = 0; kind < 2; kind++) {
+        char line[512];
+        int pos = snprintf(line, sizeof line, "GPU%d %-12s", idx, kname[kind]);
+        static const unsigned TH[] = {128, 256, 512, 1024};
+        static const unsigned BPS[] = {1, 2};
+        for (int ti = 0; ti < 4; ti++)
+            for (int bi = 0; bi < 2; bi++) {
+                unsigned threads = TH[ti], bps = BPS[bi], grid = (unsigned)info->sms * bps;
+                if (threads * bps > 1024 && cc < 80) continue;
+                if (threads * bps > 1536) continue;
+                unsigned iters = 64;
+                float ms = 0;
+                for (int rep = 0; rep < 4; rep++) {
+                    void *args[] = {&iters, &out};
+                    CK(cu.EventRecord(e0, d->st));
+                    CK(launch_t(d, f[kind], grid, 1, threads, 0, args));
+                    CK(cu.EventRecord(e1, d->st));
+                    CK(cu.EventSynchronize(e1));
+                    cu.EventElapsedTime(&ms, e0, e1);
+                    if (ms <= 0) break;
+                    if (ms < 20) iters = (unsigned)(iters * (30.0 / ms)) + 1;   // grow to ~30 ms
+                    else break;
+                }
+                double macs = (double)grid * (threads / 32) * iters * 8 * (kind ? 8192.0 : 4096.0);
+                double t = ms > 0 ? macs / (ms * 1e-3) / 1e12 : 0;
+                pos += snprintf(line + pos, sizeof line - pos, " | %2ux%u: %6.2f", threads / 32, bps, t);
+            }
+        LOGI("%s", line);
+    }
+    {   // breakdown of the v2b mining kernel at full size: each line switches parts of the work off
+        const unsigned m = 128u * info->sms, n = 2048, k = 8192;
+        const v2_variant *vb = cc >= 80 ? &V2_SM80[1] : &V2_SM75[1];
+        unsigned smem = v2_smem(vb, 16), threads = 256;
+        CUmodule m2;
+        if (load_module(d, &m2, cc >= 80 ? prl_ptx_sm80_v2_16 : prl_ptx_sm75_v2_16, "v2")) goto fail;
+        CUdeviceptr dU = 0, dP = 0, dB = 0, dS = 0, dBound = 0, dCand = 0;
+        CK(cu.MemAlloc(&dU, (size_t)m * 128)); CK(cu.MemAlloc(&dP, 2 * k)); CK(cu.MemAlloc(&dB, (size_t)n * k));
+        CK(cu.MemAlloc(&dS, 32)); CK(cu.MemAlloc(&dBound, 32)); CK(cu.MemAlloc(&dCand, CAND_WORDS * 4));
+        CK(cu.MemsetD32Async(dU, 0x01020304, (size_t)m * 32, d->st));
+        CK(cu.MemsetD32Async(dP, 0x00050003, k / 2, d->st));
+        CK(cu.MemsetD32Async(dB, 0x05fb03fd, (size_t)n * k / 4, d->st));
+        CK(cu.MemsetD32Async(dS, 7, 8, d->st));
+        CK(cu.MemsetD32Async(dBound, 0, 8, d->st));
+        static const struct { const char *fn, *what; } DK[] = {
+            {"k_v2b_nt16", "v2b full kernel"},           {"k_diag1_nt16", "- noise generation"},
+            {"k_diag2_nt16", "- B loads"},               {"k_diag3_nt16", "- generation - B loads"},
+            {"k_diag7_nt16", "- gen - loads - barriers"}, {"k_diag15_nt16", "- gen - loads - bar - fold"},
+            {"k_diag8_nt16", "- fold only"}};
+        for (size_t i = 0; i < sizeof DK / sizeof DK[0]; i++) {
+            CUfunction f2;
+            if (cu.ModuleGetFunction(&f2, m2, DK[i].fn) ||
+                (smem > 48 * 1024 && cu.FuncSetAttribute(f2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem)))
+                continue;
+            float ms = 0, best = 1e30f;
+            for (int rep = 0; rep < 4; rep++) {
+                CK(cu.MemsetD32Async(dCand, 0, 4, d->st));
+                CK(cu.EventRecord(e0, d->st));
+                CK(run_mine_fused(d, f2, threads, smem, dU, dP, 1, dB, m, n, k, dS, dBound, dCand, 0));
+                CK(cu.EventRecord(e1, d->st));
+                CK(cu.EventSynchronize(e1));
+                cu.EventElapsedTime(&ms, e0, e1);
+                if (rep && ms < best) best = ms;
+            }
+            LOGI("GPU%d breakdown %-28s %6.3f ms  %7.2f TH/s", idx, DK[i].what, best,
+                 best > 0 ? (double)m * n * k / (best * 1e-3) / 1e12 : 0);
+        }
+        CUdeviceptr fr[] = {dU, dP, dB, dS, dBound, dCand};
+        for (size_t i = 0; i < 6; i++) cu.MemFree(fr[i]);
+    }
+fail:
+    if (out) cu.MemFree(out);
+    if (d->ctx) cu.CtxDestroy(d->ctx);
+}
+
