@@ -16,8 +16,8 @@ g++ -O2 -std=c++17 -pthread -DPRL_TURING=1 -DPRL_STAGES=2 -Wno-unused-parameter 
   tests/test_kernels.cpp tests/emu.cpp build/src/pearl.o build/third_party/blake3/*.o
 ./build/test_kernels_turing
 echo "== GPU self-test through the real host backend (emulated libcuda)"
-LD_LIBRARY_PATH=build/fakecuda ./build/prlminer-portable --selftest
-FAKE_CUDA_CC=75 LD_LIBRARY_PATH=build/fakecuda ./build/prlminer-portable --selftest --tile 16
+LD_LIBRARY_PATH=build/fakecuda ./build/ejjjminer-portable --selftest
+FAKE_CUDA_CC=75 LD_LIBRARY_PATH=build/fakecuda ./build/ejjjminer-portable --selftest --tile 16
 e2e() {   # name port diff args...
   local name=$1 port=$2 diff=$3; shift 3
   python3 tests/mock_pool.py $port $diff 4 > build/pool_$name.log 2>&1 &
@@ -31,7 +31,7 @@ e2e() {   # name port diff args...
   return $rc
 }
 echo "== end-to-end: CPU backend -> mock pool (independent Python verifier)"
-e2e cpu 34101 0.01 ./build/prlminer-portable --cpu
+e2e cpu 34101 0.01 ./build/ejjjminer-portable --cpu
 echo "== end-to-end: GPU backend (emulated) -> mock pool"
-LD_LIBRARY_PATH=build/fakecuda e2e gpu 34102 0.05 ./build/prlminer-portable --rows 128
+LD_LIBRARY_PATH=build/fakecuda e2e gpu 34102 0.05 ./build/ejjjminer-portable --rows 128
 echo "ALL TESTS PASSED"

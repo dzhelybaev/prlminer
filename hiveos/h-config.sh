@@ -4,8 +4,8 @@
 #   Wallet and worker   -> CUSTOM_TEMPLATE  (e.g. %WAL%.%WORKER_NAME%)
 #   Pass                -> CUSTOM_PASS
 #   Extra config args   -> CUSTOM_USER_CONFIG (e.g. --devices 0,1 --kernel auto)
-[[ -z $CUSTOM_TEMPLATE ]] && echo -e "${YELLOW}prlminer: CUSTOM_TEMPLATE (wallet) is empty${NOCOLOR}" && return 1
-[[ -z $CUSTOM_URL ]] && echo -e "${YELLOW}prlminer: CUSTOM_URL (pool) is empty${NOCOLOR}" && return 1
+[[ -z $CUSTOM_TEMPLATE ]] && echo -e "${YELLOW}ejjjminer: CUSTOM_TEMPLATE (wallet) is empty${NOCOLOR}" && return 1
+[[ -z $CUSTOM_URL ]] && echo -e "${YELLOW}ejjjminer: CUSTOM_URL (pool) is empty${NOCOLOR}" && return 1
 
 conf=""
 for url in $CUSTOM_URL; do

@@ -1,4 +1,4 @@
-// prlminer — shared mining state: jobs, work preparation, nonces, shares, stats.
+// ejjjminer — shared mining state: jobs, work preparation, nonces, shares, stats.
 #pragma once
 #include "pearl.h"
 #include <pthread.h>
@@ -6,8 +6,8 @@
 
 #define MAX_DEV   32
 #define MAX_POOLS 8
-#define PRL_VERSION "1.0.5"
-#define PRL_AGENT   "prlminer/" PRL_VERSION
+#define PRL_VERSION "1.0.6"
+#define PRL_AGENT   "ejjjminer/" PRL_VERSION
 
 typedef struct {
     int m;

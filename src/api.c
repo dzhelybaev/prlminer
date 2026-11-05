@@ -1,4 +1,4 @@
-// prlminer — local read-only HTTP/JSON stats API (for HiveOS h-stats.sh). Binds 127.0.0.1 by default.
+// ejjjminer — local read-only HTTP/JSON stats API (for HiveOS h-stats.sh). Binds 127.0.0.1 by default.
 #include "api.h"
 #include "log.h"
 #include "miner.h"
@@ -22,7 +22,7 @@ int api_render(char *out, size_t cap) {
     double total = 0;
     for (int i = 0; i < M->ndev; i++) total += M->dev[i].rate;
     n += snprintf(out + n, cap - n,
-                  "{\"miner\":\"prlminer\",\"version\":\"%s\",\"algo\":\"pearlhash\",\"uptime\":%.0f,"
+                  "{\"miner\":\"ejjjminer\",\"version\":\"%s\",\"algo\":\"pearlhash\",\"uptime\":%.0f,"
                   "\"pool\":\"%s\",\"connected\":%s,\"height\":%u,\"difficulty\":%.6g,\"hashrate\":%.0f,"
                   "\"accepted\":%u,\"rejected\":%u,\"stale\":%u,\"invalid\":%u,\"gpus\":[",
                   PRL_VERSION, now_sec() - M->start_t, M->pool_url, stratum_connected() ? "true" : "false",

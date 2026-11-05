@@ -4,7 +4,7 @@
 
 stats_raw=$(curl --connect-timeout 2 --max-time 5 --silent --noproxy '*' "http://127.0.0.1:${MINER_API_PORT}/")
 if [[ $? -ne 0 || -z $stats_raw ]]; then
-  echo -e "${YELLOW}Failed to read prlminer API on 127.0.0.1:${MINER_API_PORT}${NOCOLOR}"
+  echo -e "${YELLOW}Failed to read ejjjminer API on 127.0.0.1:${MINER_API_PORT}${NOCOLOR}"
   khs=0
   stats="null"
 else

@@ -1,9 +1,9 @@
-// prlminer — Pearl stratum client (object-params dialect used by Suprnova, LuckyPool,
+// ejjjminer — Pearl stratum client (object-params dialect used by Suprnova, LuckyPool,
 // HeroMiners, Kryptex, ...):
 //   -> mining.authorize {wallet, worker, pass, agent}
 //   <- mining.notify    {job_id, header (76 bytes hex), target (u256 BE hex), height}
 //   -> mining.submit    {job_id, plain_proof (base64 PlainProof)}
-// The only network connection prlminer makes is this one, to the pool you configure.
+// The only network connection ejjjminer makes is this one, to the pool you configure.
 #include "stratum.h"
 #include "json.h"
 #include "log.h"

@@ -1,4 +1,4 @@
-# prlminer — открытый майнер Pearl (PRL) для NVIDIA под HiveOS
+# ejjjminer — открытый майнер Pearl (PRL) для NVIDIA под HiveOS
 
 Майнер алгоритма **pearlhash** (Proof-of-Useful-Work сети Pearl) для видеокарт NVIDIA.
 **Без комиссии разработчика и без телеметрии.** Майнер открывает ровно одно сетевое соединение —
@@ -40,7 +40,7 @@ Hash-тайл берётся из официального майнера: rows 
 
 ## Установка в HiveOS
 
-1. Положите `prlminer-1.0.5.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
+1. Положите `ejjjminer-1.0.6.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
    GitHub Releases, свой веб-сервер и т. п.
 2. Создайте полётный лист (Flight Sheet):
    - **Coin**: PRL (или любая, если такой нет);
@@ -50,8 +50,8 @@ Hash-тайл берётся из официального майнера: rows 
 
 | Поле | Значение |
 |---|---|
-| Miner name | `prlminer` |
-| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/prlminer-1.0.5.tar.gz` |
+| Miner name | `ejjjminer` |
+| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/ejjjminer-1.0.6.tar.gz` |
 | Hash algorithm | `pearlhash` |
 | Wallet and worker template | `%WAL%.%WORKER_NAME%` |
 | Pool URL | например `pearl-eu2.luckypool.io:3360` (несколько адресов через пробел = резерв) |
@@ -59,12 +59,12 @@ Hash-тайл берётся из официального майнера: rows 
 | Extra config arguments | по желанию: `--devices 0,1`, `--kernel auto`, … |
 
 Можно поставить и вручную: распакуйте архив в `/hive/miners/custom/` (получится
-`/hive/miners/custom/prlminer/`), а в полётном листе укажите тот же Miner name.
+`/hive/miners/custom/ejjjminer/`), а в полётном листе укажите тот же Miner name.
 
 Для запуска вне HiveOS:
 
 ```
-./prlminer -o pearl-eu2.luckypool.io:3360 -u prl1ВАШ_АДРЕС.rig1
+./ejjjminer -o pearl-eu2.luckypool.io:3360 -u prl1ВАШ_АДРЕС.rig1
 ```
 
 ### Совместимость с пулами
@@ -81,9 +81,9 @@ Hash-тайл берётся из официального майнера: rows 
 ## Первый запуск — обязательно
 
 ```
-./prlminer --list-devices
-./prlminer --selftest            # GPU-кернелы сверяются с CPU-эталоном бит в бит
-./prlminer --benchmark 60        # синтетическая работа, все шары проверяются локально
+./ejjjminer --list-devices
+./ejjjminer --selftest            # GPU-кернелы сверяются с CPU-эталоном бит в бит
+./ejjjminer --benchmark 60        # синтетическая работа, все шары проверяются локально
 ```
 
 Самотест выполняется и при каждом обычном старте. Если кернел на тензорных ядрах не прошёл проверку,
@@ -134,12 +134,12 @@ API: `curl http://127.0.0.1:4068/` возвращает JSON с хешрейто
 Нужны `gcc`, `clang` (≥ 15, с бэкендом NVPTX) и `python3`. CUDA Toolkit не требуется.
 
 ```
-make portable        # build/prlminer-portable (glibc ≥ 2.17)
+make portable        # build/ejjjminer-portable (glibc ≥ 2.17)
 tests/run_all.sh     # все тесты, GPU не нужен
-make package         # build/prlminer-1.0.5.tar.gz для HiveOS
+make package         # build/ejjjminer-1.0.6.tar.gz для HiveOS
 ```
 
 ## Лицензии
 
-Код prlminer — MIT. BLAKE3 (`third_party/blake3`) — CC0 / Apache-2.0. Протокол портирован из
+Код ejjjminer — MIT. BLAKE3 (`third_party/blake3`) — CC0 / Apache-2.0. Протокол портирован из
 открытого кода Pearl (ISC).

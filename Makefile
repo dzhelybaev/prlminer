@@ -1,4 +1,4 @@
-# prlminer build. Host code is plain C (C11) + POSIX threads; CUDA kernels are
+# ejjjminer build. Host code is plain C (C11) + POSIX threads; CUDA kernels are
 # compiled to PTX with clang (no CUDA toolkit needed) and embedded in the binary.
 CC      ?= gcc
 CLANG   ?= clang
@@ -24,7 +24,7 @@ OBJ_HOST= $(patsubst %.c,$(BUILD)/%.o,$(HOST)) $(BUILD)/kernels_ptx.o
 PTX_ARCH ?= sm_80
 PTX_FEAT ?= +ptx70
 
-all: $(BUILD)/prlminer
+all: $(BUILD)/ejjjminer
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -73,7 +73,7 @@ $(BUILD)/kernels_ptx.c: $(PTX_FILES) tools/embed.py
 $(BUILD)/kernels_ptx.o: $(BUILD)/kernels_ptx.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/prlminer: $(OBJ_HOST) $(OBJ_CORE) $(OBJ_B3)
+$(BUILD)/ejjjminer: $(OBJ_HOST) $(OBJ_CORE) $(OBJ_B3)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # ---- tests
@@ -102,25 +102,25 @@ $(BUILD)/fakecuda/libcuda.so.1: tests/fake_cuda.cpp tests/emu.cpp cuda/kernels.c
 
 # ---- portable binary: runs on glibc >= 2.17 (HiveOS), see tools/mkstubs.py
 OBJ_ALL = $(OBJ_HOST) $(OBJ_CORE) $(OBJ_B3)
-$(BUILD)/stubs/.done: $(BUILD)/prlminer tools/mkstubs.py
-	python3 tools/mkstubs.py $(BUILD)/prlminer $(BUILD)/stubs
+$(BUILD)/stubs/.done: $(BUILD)/ejjjminer tools/mkstubs.py
+	python3 tools/mkstubs.py $(BUILD)/ejjjminer $(BUILD)/stubs
 	@touch $@
 
-$(BUILD)/prlminer-portable: $(BUILD)/stubs/.done $(OBJ_ALL)
+$(BUILD)/ejjjminer-portable: $(BUILD)/stubs/.done $(OBJ_ALL)
 	$(CC) -pie -nodefaultlibs -o $@ $(OBJ_ALL) $(wildcard $(BUILD)/stubs/*.so.*) -lgcc
 	@python3 tools/check_glibc.py $@
 
-portable: $(BUILD)/prlminer-portable
+portable: $(BUILD)/ejjjminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.5
-package: $(BUILD)/prlminer-portable
-	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/prlminer
-	cp $(BUILD)/prlminer-portable $(BUILD)/pkg/prlminer/prlminer
-	cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh README.md LICENSE $(BUILD)/pkg/prlminer/
-	chmod +x $(BUILD)/pkg/prlminer/prlminer $(BUILD)/pkg/prlminer/h-*.sh
-	tar -C $(BUILD)/pkg -czf $(BUILD)/prlminer-$(VERSION).tar.gz --owner=0 --group=0 prlminer
-	tar -czf $(BUILD)/prlminer-src-$(VERSION).tar.gz --owner=0 --group=0 --exclude=build --exclude=__pycache__ --transform 's,^\.,prlminer-src-$(VERSION),' .
-	@ls -la $(BUILD)/prlminer-$(VERSION).tar.gz $(BUILD)/prlminer-src-$(VERSION).tar.gz
+VERSION = 1.0.6
+package: $(BUILD)/ejjjminer-portable
+	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/ejjjminer
+	cp $(BUILD)/ejjjminer-portable $(BUILD)/pkg/ejjjminer/ejjjminer
+	cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh README.md LICENSE $(BUILD)/pkg/ejjjminer/
+	chmod +x $(BUILD)/pkg/ejjjminer/ejjjminer $(BUILD)/pkg/ejjjminer/h-*.sh
+	tar -C $(BUILD)/pkg -czf $(BUILD)/ejjjminer-$(VERSION).tar.gz --owner=0 --group=0 ejjjminer
+	tar -czf $(BUILD)/ejjjminer-src-$(VERSION).tar.gz --owner=0 --group=0 --exclude=build --exclude=__pycache__ --transform 's,^\.,ejjjminer-src-$(VERSION),' .
+	@ls -la $(BUILD)/ejjjminer-$(VERSION).tar.gz $(BUILD)/ejjjminer-src-$(VERSION).tar.gz
 .PHONY: package

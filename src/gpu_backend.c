@@ -1,4 +1,4 @@
-// prlminer — NVIDIA GPU backend (CUDA driver API, PTX JIT-compiled by the driver).
+// ejjjminer — NVIDIA GPU backend (CUDA driver API, PTX JIT-compiled by the driver).
 #include "backend.h"
 #include "cuda_drv.h"
 #include "log.h"

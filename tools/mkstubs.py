@@ -7,7 +7,7 @@ to their pre-2.34 homes (libpthread.so.0 / libdl.so.2, version GLIBC_2.2.5), exa
 binary built on an old system would be. Those old bindings keep working on new glibc
 (the stub libraries still exist there for backward compatibility).
 
-usage: mkstubs.py BINARY OUTDIR    (BINARY = normally linked prlminer)"""
+usage: mkstubs.py BINARY OUTDIR    (BINARY = normally linked ejjjminer)"""
 import os
 import re
 import subprocess

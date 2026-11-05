@@ -1,4 +1,4 @@
-// prlminer CUDA kernels: noise generation, noising, and the fused
+// ejjjminer CUDA kernels: noise generation, noising, and the fused
 // noised-int8-GEMM + jackpot transcript + keyed-BLAKE3 target check.
 //
 // Hash-tile geometry (matches the mma.sync m16n8k32 accumulator layout):

@@ -1,4 +1,4 @@
-// prlminer — open-source Pearl (PRL) GPU miner for NVIDIA. No dev fee, no telemetry.
+// ejjjminer — open-source Pearl (PRL) GPU miner for NVIDIA. No dev fee, no telemetry.
 #include "api.h"
 #include "backend.h"
 #include "log.h"
@@ -17,8 +17,8 @@ static void on_signal(int s) { (void)s; g_stop = 1; }
 
 static void usage(void) {
     printf(
-        "prlminer %s — Pearl (PRL, pearlhash) miner for NVIDIA GPUs. No dev fee, no telemetry.\n\n"
-        "usage: prlminer -o HOST:PORT -u WALLET[.WORKER] [options]\n\n"
+        "ejjjminer %s — Pearl (PRL, pearlhash) miner for NVIDIA GPUs. No dev fee, no telemetry.\n\n"
+        "usage: ejjjminer -o HOST:PORT -u WALLET[.WORKER] [options]\n\n"
         "pool:\n"
         "  -o, --pool URL          stratum pool (stratum+tcp://host:port or host:port); repeat for failover\n"
         "  -u, --user LOGIN        wallet address, optionally WALLET.WORKER\n"
@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
     if (!use_cpu && ngpu <= 0) { LOGE("no NVIDIA GPUs available: %s", ngpu < 0 ? err : "none found"); return 2; }
     if (!selftest && !bench && (!npools || !user)) { usage(); fprintf(stderr, "\n-o and -u are required\n"); return 1; }
 
-    LOGI("prlminer %s — pearlhash, no dev fee, no telemetry", PRL_VERSION);
+    LOGI("ejjjminer %s — pearlhash, no dev fee, no telemetry", PRL_VERSION);
     if (miner_init(k, cols, tile)) return 1;
     g_miner.cert = !strcmp(cert, "2") ? 2 : !strcmp(cert, "3") ? 3 : 0;
     g_miner.salted_height = salted_h;

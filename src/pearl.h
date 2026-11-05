@@ -1,4 +1,4 @@
-// prlminer — Pearl (PRL) protocol core: patterns, commitments, Merkle trees,
+// ejjjminer — Pearl (PRL) protocol core: patterns, commitments, Merkle trees,
 // noise, jackpot reference, PlainProof build/serialize/verify.
 // Ported from the open-source reference implementation
 // (github.com/pearl-research-labs/pearl, zk-pow + pearl-blake3 + miner-base).

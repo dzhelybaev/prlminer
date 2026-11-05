@@ -1,4 +1,4 @@
-// prlminer — job preparation, nonce allocation, share building/verification, stats.
+// ejjjminer — job preparation, nonce allocation, share building/verification, stats.
 #include "miner.h"
 #include "log.h"
 #include "stratum.h"

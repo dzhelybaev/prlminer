@@ -1,4 +1,4 @@
-// prlminer — CPU reference backend. Very slow; used for testing the full pipeline
+// ejjjminer — CPU reference backend. Very slow; used for testing the full pipeline
 // (pool protocol, proofs) on machines without a GPU (--cpu).
 #include "backend.h"
 #include "log.h"

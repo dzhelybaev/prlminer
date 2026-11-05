@@ -1,4 +1,4 @@
-// prlminer — Pearl protocol core. See pearl.h.
+// ejjjminer — Pearl protocol core. See pearl.h.
 #include "pearl.h"
 #include "../third_party/blake3/blake3.h"
 #include "../third_party/blake3/blake3_impl.h"
