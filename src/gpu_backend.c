@@ -12,6 +12,11 @@
 extern const char prl_ptx_sm80_noise[], prl_ptx_sm80_mma32[], prl_ptx_sm80_mma16[], prl_ptx_sm80_mma8[],
     prl_ptx_sm80_dp4a32[], prl_ptx_sm80_dp4a16[], prl_ptx_sm80_dp4a8[];
 extern const char prl_ptx_sm61_noise[], prl_ptx_sm61_dp4a32[], prl_ptx_sm61_dp4a16[], prl_ptx_sm61_dp4a8[];
+extern const char prl_ptx_sm75_mma32[], prl_ptx_sm75_mma16[], prl_ptx_sm75_mma8[];
+
+static const char *ptx_turing_mma(int nt) {
+    return nt == 32 ? prl_ptx_sm75_mma32 : nt == 16 ? prl_ptx_sm75_mma16 : prl_ptx_sm75_mma8;
+}
 
 static const char *ptx_for(bool sm80, const char *kind) {
     static const struct { const char *k; const char *p80, *p61; } T[] = {
@@ -258,19 +263,23 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
             CK(cu.FuncSetAttribute(d->f_apply, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, APPLY_SMEM(g_miner.k)));
         char kn[32], fname[64];
         unsigned smem_dp4a = sm80 ? SMEM_MMA : SMEM_DP4A_SM61;
-        bool want_mma = sm80 && strcmp(kernel, "dp4a") != 0;
-        if (!strcmp(kernel, "mma") && !sm80) LOGW("GPU%d: tensor-core kernel needs compute 8.0+, using dp4a", stat_idx);
+        bool turing = cc >= 75 && cc < 80;
+        bool want_mma = (sm80 || turing) && strcmp(kernel, "dp4a") != 0;
+        if (!strcmp(kernel, "mma") && !sm80 && !turing)
+            LOGW("GPU%d: tensor-core kernel needs compute 7.5+, using dp4a", stat_idx);
         bool done = false;
         if (want_mma) {
             CUmodule mm;
             CUfunction fm;
+            unsigned smem_mma = sm80 ? SMEM_MMA : SMEM_DP4A_SM61;   // Turing: 2-stage pipeline
             snprintf(kn, sizeof kn, "mma%d", g_miner.nt);
             snprintf(fname, sizeof fname, "k_mine_mma_nt%d", g_miner.nt);
-            if (load_module(d, &mm, ptx_for(true, kn), kn)) goto fail;
+            if (load_module(d, &mm, sm80 ? ptx_for(true, kn) : ptx_turing_mma(g_miner.nt), kn)) goto fail;
             CK(cu.ModuleGetFunction(&fm, mm, fname));
-            CK(cu.FuncSetAttribute(fm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMEM_MMA));
-            if (selftest_kernel(d, fm, SMEM_MMA, "tensor-core")) {
-                d->f_mine = fm; d->smem = SMEM_MMA; d->mma = true; done = true;
+            if (smem_mma > 48 * 1024)
+                CK(cu.FuncSetAttribute(fm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_mma));
+            if (selftest_kernel(d, fm, smem_mma, "tensor-core")) {
+                d->f_mine = fm; d->smem = smem_mma; d->mma = true; done = true;
             } else LOGW("GPU%d: tensor-core kernel failed the self-test, falling back to dp4a", stat_idx);
         }
         if (!done) {

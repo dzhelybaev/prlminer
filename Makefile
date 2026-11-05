@@ -39,6 +39,7 @@ $(BUILD)/%.o: %.S
 #   sm_61 PTX (dp4a): GTX 10xx / 16xx, RTX 20xx
 PTX80 = noise mma32 mma16 mma8 dp4a32 dp4a16 dp4a8
 PTX61 = noise dp4a32 dp4a16 dp4a8
+PTX75 = mma32 mma16 mma8
 KDEF_noise = -DK_NOISE
 KDEF_mma32 = -DK_MMA32
 KDEF_mma16 = -DK_MMA16
@@ -56,11 +57,18 @@ $(BUILD)/ptx/sm61_%.ptx: cuda/kernels.cu cuda/common.cuh
 	@mkdir -p $(dir $@)
 	$(CLANG) $(CUFLAGS) --cuda-gpu-arch=sm_61 -Xclang -target-feature -Xclang +ptx60 -DPRL_MMA=0 $(KDEF_$*) -o $@ $<
 
-PTX_FILES = $(patsubst %,$(BUILD)/ptx/sm80_%.ptx,$(PTX80)) $(patsubst %,$(BUILD)/ptx/sm61_%.ptx,$(PTX61))
+# Turing (sm_75): tensor cores via mma.m8n8k16, synchronous copies
+$(BUILD)/ptx/sm75_%.ptx: cuda/kernels.cu cuda/common.cuh
+	@mkdir -p $(dir $@)
+	$(CLANG) $(CUFLAGS) --cuda-gpu-arch=sm_75 -Xclang -target-feature -Xclang +ptx65 -DPRL_MMA=1 -DPRL_TURING=1 $(KDEF_$*) -o $@ $<
+
+PTX_FILES = $(patsubst %,$(BUILD)/ptx/sm80_%.ptx,$(PTX80)) $(patsubst %,$(BUILD)/ptx/sm61_%.ptx,$(PTX61)) \
+            $(patsubst %,$(BUILD)/ptx/sm75_%.ptx,$(PTX75))
 
 $(BUILD)/kernels_ptx.c: $(PTX_FILES) tools/embed.py
 	python3 tools/embed.py $@ $(foreach k,$(PTX80),prl_ptx_sm80_$(k)=$(BUILD)/ptx/sm80_$(k).ptx) \
-	  $(foreach k,$(PTX61),prl_ptx_sm61_$(k)=$(BUILD)/ptx/sm61_$(k).ptx)
+	  $(foreach k,$(PTX61),prl_ptx_sm61_$(k)=$(BUILD)/ptx/sm61_$(k).ptx) \
+	  $(foreach k,$(PTX75),prl_ptx_sm75_$(k)=$(BUILD)/ptx/sm75_$(k).ptx)
 
 $(BUILD)/kernels_ptx.o: $(BUILD)/kernels_ptx.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -106,7 +114,7 @@ portable: $(BUILD)/prlminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.3
+VERSION = 1.0.4
 package: $(BUILD)/prlminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/prlminer
 	cp $(BUILD)/prlminer-portable $(BUILD)/pkg/prlminer/prlminer

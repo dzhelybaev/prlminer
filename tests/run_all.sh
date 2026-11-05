@@ -11,6 +11,10 @@ if [[ -n "$PEARL_REPO" ]]; then
 fi
 echo "== CUDA kernels in the SIMT emulator vs CPU reference"
 ./build/test_kernels
+echo "== Turing (mma.m8n8k16) kernels in the emulator"
+g++ -O2 -std=c++17 -pthread -DPRL_TURING=1 -DPRL_STAGES=2 -Wno-unused-parameter -o build/test_kernels_turing \
+  tests/test_kernels.cpp tests/emu.cpp build/src/pearl.o build/third_party/blake3/*.o
+./build/test_kernels_turing
 echo "== GPU self-test through the real host backend (emulated libcuda)"
 LD_LIBRARY_PATH=build/fakecuda ./build/prlminer-portable --selftest
 FAKE_CUDA_CC=75 LD_LIBRARY_PATH=build/fakecuda ./build/prlminer-portable --selftest --tile 16

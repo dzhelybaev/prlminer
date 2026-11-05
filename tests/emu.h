@@ -11,6 +11,7 @@ u32 emu_bid_y();
 u8 *emu_smem();
 void emu_bar_sync();
 void emu_mma_s8(i32 d[4], const u32 a[4], const u32 b[2]);
+void emu_mma_m8n8k16(i32 *d, u32 a, u32 b);   // Turing fragment model
 
 // Runs body() for every thread of every block (blocks sequentially, threads concurrently).
 // Same, but threads run one after another in the caller (only for kernels without barriers).

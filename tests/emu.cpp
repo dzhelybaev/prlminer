@@ -53,6 +53,31 @@ void emu_mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) {
     }
 }
 
+// mma.sync.m8n8k16.row.col.s32.s8.s8.s32 (PTX ISA): A 8x16 row: a = A[g][4q..4q+3];
+// B 16x8 col: b = B[4q..4q+3][g]; C 8x8: d0 = (g, 2q), d1 = (g, 2q+1)
+void emu_mma_m8n8k16(i32 *d, u32 a, u32 b) {
+    WarpScratch &w = g_warps[t_tid / 32];
+    u32 lane = t_tid & 31;
+    w.a[lane][0] = a;
+    w.b[lane][0] = b;
+    pthread_barrier_wait(&w.bar);
+    int8_t A[8][16], B[16][8];
+    for (int L = 0; L < 32; L++) {
+        int g = L >> 2, q = L & 3;
+        for (int i = 0; i < 4; i++) {
+            A[g][4 * q + i] = (int8_t)(w.a[L][0] >> (8 * i));
+            B[4 * q + i][g] = (int8_t)(w.b[L][0] >> (8 * i));
+        }
+    }
+    pthread_barrier_wait(&w.bar);
+    int g = lane >> 2, q = lane & 3;
+    for (int e = 0; e < 2; e++) {
+        int32_t s = 0;
+        for (int kk = 0; kk < 16; kk++) s += (int32_t)A[g][kk] * (int32_t)B[kk][2 * q + e];
+        d[e] += s;
+    }
+}
+
 struct ThreadArg {
     u32 tid, bx, by;
     u8 *smem;

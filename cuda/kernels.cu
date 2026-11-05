@@ -18,10 +18,10 @@
 #define NTHREADS 256
 #if defined(PRL_STAGES)
 #define STAGES PRL_STAGES
-#elif defined(PRL_EMU) || PRL_MMA
+#elif defined(PRL_EMU) || (PRL_MMA && !PRL_TURING)
 #define STAGES 3
 #else
-#define STAGES 2         // sm_61: 48 KB shared memory limit
+#define STAGES 2         // sm_61/sm_75: synchronous copies, 48 KB shared memory
 #endif
 #define STAGE_BYTES ((BM + BN) * SROW)
 #define NCAND_WORDS 4    // candidate record: t_rows, t_cols, hash word 7, hash word 6

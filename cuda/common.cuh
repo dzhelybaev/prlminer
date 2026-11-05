@@ -33,7 +33,7 @@ DEVINL u32 smem_addr(const void *p) {
     asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(r) : "l"(p));
     return r;
 }
-#if PRL_MMA
+#if PRL_MMA && !PRL_TURING
 DEVINL void cp_async16(void *smem_dst, const void *gsrc) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_addr(smem_dst)), "l"(gsrc));
 }
@@ -54,7 +54,20 @@ DEVINL i32 dp4a(u32 a, u32 b, i32 c) {
     return d;
 }
 
-#if PRL_MMA
+#if PRL_MMA && PRL_TURING
+// Turing (sm_75): m16n8k32 expressed as four m8n8k16 ops. Fragment layouts line up exactly:
+//   m8n8k16 A = 1 reg (row g, k 4q..4q+3), B = 1 reg (k 4q..4q+3, col g), C = 2 regs (row g, cols 2q, 2q+1)
+DEVINL void mma_m8n8k16(i32 *d, u32 a, u32 b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                 : "+r"(d[0]), "+r"(d[1]) : "r"(a), "r"(b));
+}
+DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) {
+    mma_m8n8k16(d, a[0], b[0]);       // rows 0-7,  k 0-15
+    mma_m8n8k16(d, a[2], b[1]);       // rows 0-7,  k 16-31
+    mma_m8n8k16(d + 2, a[1], b[0]);   // rows 8-15, k 0-15
+    mma_m8n8k16(d + 2, a[3], b[1]);   // rows 8-15, k 16-31
+}
+#elif PRL_MMA
 // D = A(16x32 s8, row) * B(32x8 s8, col) + C (s32)
 DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) {
     asm volatile(
@@ -88,7 +101,16 @@ DEVINL i32 dp4a(u32 a, u32 b, i32 c) {
     for (int i = 0; i < 4; i++) c += (i32)(i8)(a >> (8 * i)) * (i32)(i8)(b >> (8 * i));
     return c;
 }
+#ifdef PRL_TURING
+DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) {
+    emu_mma_m8n8k16(d, a[0], b[0]);
+    emu_mma_m8n8k16(d, a[2], b[1]);
+    emu_mma_m8n8k16(d + 2, a[1], b[0]);
+    emu_mma_m8n8k16(d + 2, a[3], b[1]);
+}
+#else
 DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) { emu_mma_s8(d, a, b); }
+#endif
 #endif
 
 DEVINL u32 rotl32(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
