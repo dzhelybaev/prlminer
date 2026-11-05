@@ -70,7 +70,8 @@ static void test_noise() {
     printf("noise kernels ok\n");
 }
 
-static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k, fmine_fn ffn = nullptr, u32 fsmem = 0) {
+static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k, fmine_fn ffn = nullptr, u32 fsmem = 0,
+                      u32 threads = NTHREADS) {
     std::vector<i8> A(m * k), Bt(n * k), U(m * 128);
     std::vector<u8> P(2 * k);
     const uint64_t nonce = 0x0123456789abcdefULL ^ ((uint64_t)m << 40);
@@ -126,7 +127,7 @@ static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k,
     u256_from_le_bytes(&bound, le.data());
     std::vector<u32> dbg(ntiles * 16, 0xdeadbeef), cand(4 + 4 * 64, 0);
     if (ffn)
-        emu_launch(n / BN, m / BM, NTHREADS, fsmem ? fsmem : STAGES * STAGE_BYTES + FUSED_SMEM, [&]() {
+        emu_launch(n / BN, m / BM, threads, fsmem ? fsmem : STAGES * STAGE_BYTES + FUSED_SMEM, [&]() {
             ffn(U.data(), P.data(), (u32)nonce, (u32)(nonce >> 32), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64,
                 dbg.data());
         });
@@ -168,6 +169,9 @@ int main() {
             u32 sm = v.stg * v.bks * V2_SLICE + 16384 + 16384 * (v.jsm < v.mt ? v.jsm : v.mt);
             test_mine(v.name, nullptr, v.nt, 128, 256, 2048, v.f, sm);
         }
+        test_mine("k_v3a_nt16", nullptr, 16, 128, 256, 2048, k_v3a_nt16, 131072, 512);
+        test_mine("k_v3b_nt16", nullptr, 16, 128, 256, 2048, k_v3b_nt16, 131072, 512);
+        test_mine("k_v3a_nt16 multi", nullptr, 16, 256, 512, 4096, k_v3a_nt16, 131072, 512);
         test_mine("k_v2a_nt16 multi", nullptr, 16, 256, 512, 4096, k_v2a_nt16, 131072);
     }
     if (fails) { printf("%d FAILURES\n", fails); return 1; }

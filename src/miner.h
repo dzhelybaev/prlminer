@@ -6,7 +6,7 @@
 
 #define MAX_DEV   32
 #define MAX_POOLS 8
-#define PRL_VERSION "1.0.9"
+#define PRL_VERSION "1.0.10"
 #define PRL_AGENT   "ejjjminer/" PRL_VERSION
 
 typedef struct {

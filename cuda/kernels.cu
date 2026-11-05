@@ -392,6 +392,7 @@ template <int MT, int NT, int BKS, int STG, int JSM, bool PF>
 DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k,
                     const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
     constexpr int WARPS_N = BN / (8 * NT);
+    constexpr int NWARP = (BM / (16 * MT)) * WARPS_N, NTH = 32 * NWARP, CPI = 512 / NTH;   // threads, B chunks/thread
     constexpr int JS = JSM > MT ? MT : JSM;   // sub-tiles 0..JS-1 keep transcript words in smem
     constexpr u32 STAGE = BKS * V2_SLICE;
     constexpr u32 ELT = STG * STAGE, JPO = ELT + 128 * 128;   // byte offsets of ELt and the transcript words
@@ -406,7 +407,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     const u32 a_ld = v2_off(wrow + (lane & 7) + 8 * ((lane >> 3) & 1), lane >> 4);                 // + 512*a
     const u32 b_ld = V2_SLICE_A + v2_off(wcol + 8 * (lane >> 4) + (lane & 7), (lane >> 3) & 1);    // + 512*bp
     const u32 g_st = v2_off(lane, warp >> 2) + 4 * (warp & 3);                                      // + 1024*j
-    const u32 c_st = V2_SLICE_A + v2_off(tid >> 1, tid & 1);                                        // + 4096*i
+    const u32 c_st = V2_SLICE_A + v2_off(tid >> 1, tid & 1);                                        // + 16*NTH*i
     const i8 *bsrc = Bt + (u64)(col0 + (tid >> 1)) * k + 16 * (tid & 1);                            // + 128k*i
     const saddr_t elt = sb + ELT + 4 * lane, jpa = sb + JPO + 4 * tid;
 
@@ -418,13 +419,13 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         for (int b = 0; b < NT; b++) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0;
 #pragma unroll
         for (int j = 0; j < 16; j++) {
-            if (a < JS) sts32(jpa + 1024 * (j * JS + a), 0);
+            if (a < JS) sts32(jpa + 4 * NTH * (j * JS + a), 0);
             else jpr[a][j] = 0;
         }
     }
     const u32 *P32 = (const u32 *)P;
     u32 pw0, pw1, gen_kt = 0;
-    {   // stage this block's 128 uniform rows transposed: word (f, rg) = bytes U[rg + 32j][f], j = 0..3
+    if (warp < 8) {   // stage this block's 128 uniform rows transposed: word (f, rg) = bytes U[rg + 32j][f]
         const u32 fb = warp * 16;
         u32 x[4][4];
 #pragma unroll
@@ -442,8 +443,8 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         }
         pw0 = P32[2 * warp];
         pw1 = P32[2 * warp + 1];
-        BAR_SYNC();
     }
+    BAR_SYNC();
     const u32 nk = k / 32, ns = nk / BKS;
 
     // warp w generates lines 4w..4w+3 of a k32 slice for rows lane + 32j
@@ -471,7 +472,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         }
     };
 #if !V2_ASYNC
-    u32 breg[BKS][2][4];
+    u32 breg[BKS][CPI][4];
 #endif
     auto issue = [&](u32 st, u32 s) {
 #pragma unroll
@@ -479,20 +480,20 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
             const saddr_t As = sb + st * STAGE + j * V2_SLICE;
             const u32 ks = s * BKS + j;
 #pragma unroll
-            for (int i = 0; i < 2; i++) {
-                const i8 *src = bsrc + (u64)128 * i * k + ks * 32;
+            for (int i = 0; i < CPI; i++) {
+                const i8 *src = bsrc + (u64)(NTH / 2) * i * k + ks * 32;
 #if V2_ASYNC
-                cp_async16s(As + c_st + 4096 * i, src);
+                cp_async16s(As + c_st + 16 * NTH * i, src);
 #else
                 if constexpr (PF) ldg128(breg[j][i], src);
                 else {   // synchronous copy
                     u32 t[4];
                     ldg128(t, src);
-                    sts128s(As + c_st + 4096 * i, t);
+                    sts128s(As + c_st + 16 * NTH * i, t);
                 }
 #endif
             }
-            gen_slice(As);
+            if (warp < 8) gen_slice(As);   // 8 warps generate (spread evenly over the 4 schedulers)
         }
     };
     auto commit = [&](u32 st) {
@@ -501,7 +502,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
 #pragma unroll
             for (int j = 0; j < BKS; j++)
 #pragma unroll
-                for (int i = 0; i < 2; i++) sts128s(sb + st * STAGE + j * V2_SLICE + c_st + 4096 * i, breg[j][i]);
+                for (int i = 0; i < CPI; i++) sts128s(sb + st * STAGE + j * V2_SLICE + c_st + 16 * NTH * i, breg[j][i]);
         }
 #endif
     };
@@ -509,7 +510,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
 #pragma unroll
         for (int a = 0; a < MT; a++) {
             if (a < JS) {
-                const saddr_t p = jpa + 1024 * ((chunk & 15) * JS + a);
+                const saddr_t p = jpa + 4 * NTH * ((chunk & 15) * JS + a);
                 sts32(p, rotl32(lds32(p), 13) ^ x[a]);
             } else {
                 u32 head = rotl32(jpr[a][0], 13) ^ x[a];
@@ -584,7 +585,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         u32 words[16];
 #pragma unroll
         for (int j = 0; j < 16; j++) {
-            if (a < JS) words[j] = lds32(jpa + 1024 * (j * JS + a));
+            if (a < JS) words[j] = lds32(jpa + 4 * NTH * (j * JS + a));
             else words[j] = jpr[a][j];
         }
         u32 t_rows = row0 + wrow + 16 * a + g;
@@ -619,15 +620,19 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
 }
 
 // variants: BKS, STG, JSM (sub-tiles with transcript in smem, 9 = all), PF (Turing register prefetch)
-// host computes smem = STG*BKS*V2_SLICE + 16384 + 16384*min(JSM, MT)
+// host computes smem = STG*BKS*V2_SLICE + 16384 + 16384*min(JSM, MT)*(threads/256)
 #if V2_ASYNC
 #define V2_A 1, 4, 9, false
 #define V2_B 2, 2, 9, false
 #define V2_C 1, 3, 0, false
+#define V3_A 1, 3, 9, false
+#define V3_B 2, 2, 9, false
 #else
 #define V2_A 1, 2, 1, true
 #define V2_B 1, 2, 1, false
 #define V2_C 1, 2, 0, true
+#define V3_A 1, 2, 0, true
+#define V3_B 1, 2, 0, false
 #endif
 
 #define MINE_ARGS const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 *seed8, const u32 *bound8, \
@@ -671,6 +676,9 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_v2b_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_B>(
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt32(FMINE_ARGS) { mine_v2<1, 32, V2_C>(V2_PASS); }
 #endif
 #if defined(PRL_EMU) || (PRL_MMA && defined(K_V2_16))
+// v3: 512 threads (16 warps, 4 per scheduler), warp tile 16x128, <= 128 registers
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v3a_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_A>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_v3b_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2b_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_v2c_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_C>(V2_PASS); }
