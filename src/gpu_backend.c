@@ -282,10 +282,11 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
             if (selftest_kernel(d, fd, smem_dp4a, "dp4a")) { d->f_mine = fd; d->smem = smem_dp4a; d->mma = false; }
             else { LOGE("GPU%d: all kernels failed the self-test, device disabled", stat_idx); goto fail; }
         }
-        int regs = 0;
+        int regs = 0, lmem = 0;
         cu.FuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, d->f_mine);
+        cu.FuncGetAttribute(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, d->f_mine);
         snprintf(ds->kernel, sizeof ds->kernel, "%s-nt%d", d->mma ? "mma" : "dp4a", g_miner.nt);
-        LOGD("GPU%d: kernel %s, %d registers", stat_idx, ds->kernel, regs);
+        LOGI("GPU%d: kernel %s: %d registers, %d bytes local memory (spills)", stat_idx, ds->kernel, regs, lmem);
     }
     // rows: one 128-row block per SM per 256-column block -> grid = SMs x (n/256) blocks
     d->m = rows > 0 ? rows : BM * info->sms;
@@ -377,6 +378,31 @@ static void *gpu_main(void *arg) {
     uint8_t *hb = NULL;
     CKF(cu.MemAllocHost((void **)&hb, 64));
     const uint64_t work = (uint64_t)m * n * k;
+    {   // one-time profile of a full-size attempt: noise vs GEMM time
+        CUevent e0, e1, e2;
+        CKF(cu.EventCreate(&e0, 0)); CKF(cu.EventCreate(&e1, 0)); CKF(cu.EventCreate(&e2, 0));
+        memset(slots[0].hseed, 0x5a, 32);
+        CKF(cu.MemcpyHtoD(slots[0].dseed, slots[0].hseed, 32));
+        uint32_t zero[8] = {0};
+        CKF(cu.MemcpyHtoD(dBound, zero, 32));
+        noise_bufs nb = {dB, dUb, dPb, dBn, slots[0].dseed};
+        CKF(run_noise(d, &nb, 1, n, k, 0, 0));
+        float tn = 0, tg = 0;
+        for (int it = 0; it < 3; it++) {
+            noise_bufs na = {dA, dUa, dPa, dAn, slots[0].dseed};
+            CKF(cu.EventRecord(e0, d->st));
+            CKF(run_noise(d, &na, 0, m, k, 1, 1));
+            CKF(cu.EventRecord(e1, d->st));
+            CKF(run_mine(d, d->f_mine, d->smem, dAn, dBn, m, n, k, slots[0].dseed, dBound, slots[0].dcand, 0));
+            CKF(cu.EventRecord(e2, d->st));
+            CKF(cu.EventSynchronize(e2));
+            cu.EventElapsedTime(&tn, e0, e1);
+            cu.EventElapsedTime(&tg, e1, e2);
+        }
+        char b1[32];
+        LOGI("GPU%d: profile: attempt %.2f ms = noise %.2f ms + GEMM %.2f ms; GEMM alone %sH/s", d->idx, tn + tg, tn,
+             tg, fmt_rate(tg > 0 ? (double)m * n * k / (tg * 1e-3) : 0, b1, sizeof b1));
+    }
     M->dev[d->idx].active = 1;
     uint8_t last_bseed[32];
     int have_b = 0;

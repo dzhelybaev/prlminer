@@ -40,8 +40,8 @@ Hash-тайл берётся из официального майнера: rows 
 
 ## Установка в HiveOS
 
-1. Готовый пакет лежит в репозитории, ссылка для HiveOS:
-   `https://github.com/dzhelybaev/prlminer/raw/main/dist/prlminer-1.0.0.tar.gz`
+1. Положите `prlminer-1.0.1.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
+   GitHub Releases, свой веб-сервер и т. п.
 2. Создайте полётный лист (Flight Sheet):
    - **Coin**: PRL (или любая, если такой нет);
    - **Wallet**: ваш `prl1…` адрес;
@@ -51,7 +51,7 @@ Hash-тайл берётся из официального майнера: rows 
 | Поле | Значение |
 |---|---|
 | Miner name | `prlminer` |
-| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/prlminer-1.0.0.tar.gz` |
+| Installation URL | ссылка на `prlminer-1.0.1.tar.gz` |
 | Hash algorithm | `pearlhash` |
 | Wallet and worker template | `%WAL%.%WORKER_NAME%` |
 | Pool URL | например `pearl-eu2.luckypool.io:3360` (несколько адресов через пробел = резерв) |
@@ -136,7 +136,7 @@ API: `curl http://127.0.0.1:4068/` возвращает JSON с хешрейто
 ```
 make portable        # build/prlminer-portable (glibc ≥ 2.17)
 tests/run_all.sh     # все тесты, GPU не нужен
-make package         # build/prlminer-1.0.0.tar.gz для HiveOS
+make package         # build/prlminer-1.0.1.tar.gz для HiveOS
 ```
 
 ## Лицензии
