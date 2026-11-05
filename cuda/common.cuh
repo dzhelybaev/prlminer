@@ -47,6 +47,11 @@ template <int N> DEVINL void cp_async_wait() {}
 #endif
 
 DEVINL u32 atomic_add_u32(u32 *p, u32 v) { return (u32)__nvvm_atom_add_gen_i((int *)p, (int)v); }
+DEVINL u32 byte_perm(u32 a, u32 b, u32 s) {
+    u32 d;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s));
+    return d;
+}
 
 DEVINL i32 dp4a(u32 a, u32 b, i32 c) {
     i32 d;
@@ -97,6 +102,12 @@ DEVINL void cp_async16(void *dst, const void *src) { __builtin_memcpy(dst, src, 
 DEVINL void cp_async_commit() {}
 template <int N> DEVINL void cp_async_wait() {}
 DEVINL u32 atomic_add_u32(u32 *p, u32 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+DEVINL u32 byte_perm(u32 a, u32 b, u32 s) {
+    u64 x = (u64)a | ((u64)b << 32);
+    u32 r = 0;
+    for (int i = 0; i < 4; i++) r |= (u32)((x >> (8 * ((s >> (4 * i)) & 7))) & 0xff) << (8 * i);
+    return r;
+}
 DEVINL i32 dp4a(u32 a, u32 b, i32 c) {
     for (int i = 0; i < 4; i++) c += (i32)(i8)(a >> (8 * i)) * (i32)(i8)(b >> (8 * i));
     return c;
@@ -112,6 +123,17 @@ DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) {
 DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) { emu_mma_s8(d, a, b); }
 #endif
 #endif
+
+// per-byte wrapping add / subtract of packed int8 (SWAR)
+DEVINL u32 badd4(u32 a, u32 b) { return ((a & 0x7f7f7f7fu) + (b & 0x7f7f7f7fu)) ^ ((a ^ b) & 0x80808080u); }
+DEVINL u32 bsub4(u32 a, u32 b) { return ((a | 0x80808080u) - (b & 0x7f7f7f7fu)) ^ ((a ^ ~b) & 0x80808080u); }
+// 4x4 byte transpose: y[i].byte[j] = x[j].byte[i]
+DEVINL void transpose4(u32 x0, u32 x1, u32 x2, u32 x3, u32 y[4]) {
+    u32 t0 = byte_perm(x0, x1, 0x5140), t1 = byte_perm(x0, x1, 0x7362);
+    u32 t2 = byte_perm(x2, x3, 0x5140), t3 = byte_perm(x2, x3, 0x7362);
+    y[0] = byte_perm(t0, t2, 0x5410); y[1] = byte_perm(t0, t2, 0x7632);
+    y[2] = byte_perm(t1, t3, 0x5410); y[3] = byte_perm(t1, t3, 0x7632);
+}
 
 DEVINL u32 rotl32(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
 DEVINL u32 rotr32(u32 x, u32 n) { return (x >> n) | (x << (32 - n)); }

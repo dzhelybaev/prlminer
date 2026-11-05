@@ -26,7 +26,9 @@ static void usage(void) {
         "  -p, --pass PASS         pool password (default x; e.g. d=1000000 for fixed difficulty)\n"
         "devices:\n"
         "  -d, --devices LIST      CUDA device indices, e.g. 0,1,3 (default: all)\n"
-        "      --kernel K          auto | mma (tensor cores, RTX 30xx+) | dp4a (default auto)\n"
+        "      --kernel K          auto | mma (tensor cores, RTX 20xx+) | dp4a (default auto)\n"
+        "      --fused M           auto | on | off: noise generated inside the GEMM kernel\n"
+        "                          (auto = measure both at start, use the faster; default auto)\n"
         "      --rows N            matrix rows per attempt (default: 128 x SM count)\n"
         "      --list-devices      list GPUs and exit\n"
         "      --selftest          run the GPU self-test and exit\n"
@@ -51,7 +53,7 @@ static void usage(void) {
 }
 
 enum {
-    O_KERNEL = 1000, O_ROWS, O_LIST, O_SELFTEST, O_CPU, O_TILE, O_K, O_COLS, O_CERT, O_SALTH, O_APIPORT,
+    O_KERNEL = 1000, O_FUSED, O_ROWS, O_LIST, O_SELFTEST, O_CPU, O_TILE, O_K, O_COLS, O_CERT, O_SALTH, O_APIPORT,
     O_APIHOST, O_BENCH, O_BENCHDIFF, O_PRINT, O_LOG, O_DEBUG, O_SHARET
 };
 
@@ -66,7 +68,7 @@ int main(int argc, char **argv) {
     double bench_diff = 100000;
     static struct option opts[] = {
         {"pool", 1, 0, 'o'}, {"url", 1, 0, 'o'}, {"user", 1, 0, 'u'}, {"wallet", 1, 0, 'u'}, {"worker", 1, 0, 'w'},
-        {"pass", 1, 0, 'p'}, {"devices", 1, 0, 'd'}, {"kernel", 1, 0, O_KERNEL}, {"rows", 1, 0, O_ROWS},
+        {"pass", 1, 0, 'p'}, {"devices", 1, 0, 'd'}, {"kernel", 1, 0, O_KERNEL}, {"fused", 1, 0, O_FUSED}, {"rows", 1, 0, O_ROWS},
         {"list-devices", 0, 0, O_LIST}, {"selftest", 0, 0, O_SELFTEST}, {"cpu", 0, 0, O_CPU},
         {"tile", 1, 0, O_TILE}, {"k", 1, 0, O_K}, {"cols", 1, 0, O_COLS}, {"cert", 1, 0, O_CERT},
         {"salted-height", 1, 0, O_SALTH}, {"api-port", 1, 0, O_APIPORT}, {"api-host", 1, 0, O_APIHOST},
@@ -84,6 +86,7 @@ int main(int argc, char **argv) {
         case 'p': pass = optarg; break;
         case 'd': devices = optarg; break;
         case O_KERNEL: kernel = optarg; break;
+        case O_FUSED: g_fused_mode = !strcmp(optarg, "on") ? 1 : !strcmp(optarg, "off") ? -1 : 0; break;
         case O_ROWS: rows = atoi(optarg); break;
         case O_LIST: list = 1; break;
         case O_SELFTEST: selftest = 1; break;

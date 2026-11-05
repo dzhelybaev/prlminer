@@ -25,3 +25,4 @@ cpu_dev *cpu_prepare(int stat_idx, int threads, int rows);
 int cpu_launch(cpu_dev *d);
 
 extern volatile int g_benchmark;
+extern int g_fused_mode;   // 0 auto (profile and pick the faster), 1 always fused, -1 never

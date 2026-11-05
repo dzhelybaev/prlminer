@@ -37,13 +37,16 @@ $(BUILD)/%.o: %.S
 # ---- CUDA -> PTX. One module per kernel so the driver only JIT-compiles what a GPU uses.
 #   sm_80 PTX (cp.async + mma.sync tensor cores): RTX 30xx / 40xx / 50xx, A100, H100 ...
 #   sm_61 PTX (dp4a): GTX 10xx / 16xx, RTX 20xx
-PTX80 = noise mma32 mma16 mma8 dp4a32 dp4a16 dp4a8
+PTX80 = noise mma32 mma16 mma8 fmma32 fmma16 fmma8 dp4a32 dp4a16 dp4a8
 PTX61 = noise dp4a32 dp4a16 dp4a8
-PTX75 = mma32 mma16 mma8
+PTX75 = mma32 mma16 mma8 fmma32 fmma16 fmma8
 KDEF_noise = -DK_NOISE
 KDEF_mma32 = -DK_MMA32
 KDEF_mma16 = -DK_MMA16
 KDEF_mma8 = -DK_MMA8
+KDEF_fmma32 = -DK_FMMA32
+KDEF_fmma16 = -DK_FMMA16
+KDEF_fmma8 = -DK_FMMA8
 KDEF_dp4a32 = -DK_DP4A32
 KDEF_dp4a16 = -DK_DP4A16
 KDEF_dp4a8 = -DK_DP4A8
@@ -114,7 +117,7 @@ portable: $(BUILD)/ejjjminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.6
+VERSION = 1.0.7
 package: $(BUILD)/ejjjminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/ejjjminer
 	cp $(BUILD)/ejjjminer-portable $(BUILD)/pkg/ejjjminer/ejjjminer

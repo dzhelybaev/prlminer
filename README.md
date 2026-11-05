@@ -40,7 +40,7 @@ Hash-тайл берётся из официального майнера: rows 
 
 ## Установка в HiveOS
 
-1. Положите `ejjjminer-1.0.6.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
+1. Положите `ejjjminer-1.0.7.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
    GitHub Releases, свой веб-сервер и т. п.
 2. Создайте полётный лист (Flight Sheet):
    - **Coin**: PRL (или любая, если такой нет);
@@ -51,7 +51,7 @@ Hash-тайл берётся из официального майнера: rows 
 | Поле | Значение |
 |---|---|
 | Miner name | `ejjjminer` |
-| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/ejjjminer-1.0.6.tar.gz` |
+| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/ejjjminer-1.0.7.tar.gz` |
 | Hash algorithm | `pearlhash` |
 | Wallet and worker template | `%WAL%.%WORKER_NAME%` |
 | Pool URL | например `pearl-eu2.luckypool.io:3360` (несколько адресов через пробел = резерв) |
@@ -100,6 +100,7 @@ Hash-тайл берётся из официального майнера: rows 
 -p, --pass PASS       пароль пула (x, d=…)
 -d, --devices LIST    индексы CUDA-устройств, напр. 0,2
     --kernel K        auto | mma | dp4a
+    --fused M         auto | on | off — шум генерируется прямо в GEMM-ядре (auto: замер при старте)
     --rows N          строк матрицы на попытку (по умолчанию 128 × число SM)
     --tile W          32 (официальный тайл 2×64, по умолчанию) | 16 | 8
     --cert C          auto | 2 | 3 — версия деривации сидов (auto: v3 с высоты 99000)
@@ -136,7 +137,7 @@ API: `curl http://127.0.0.1:4068/` возвращает JSON с хешрейто
 ```
 make portable        # build/ejjjminer-portable (glibc ≥ 2.17)
 tests/run_all.sh     # все тесты, GPU не нужен
-make package         # build/ejjjminer-1.0.6.tar.gz для HiveOS
+make package         # build/ejjjminer-1.0.7.tar.gz для HiveOS
 ```
 
 ## Лицензии

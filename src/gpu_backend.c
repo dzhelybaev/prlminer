@@ -13,10 +13,18 @@ extern const char prl_ptx_sm80_noise[], prl_ptx_sm80_mma32[], prl_ptx_sm80_mma16
     prl_ptx_sm80_dp4a32[], prl_ptx_sm80_dp4a16[], prl_ptx_sm80_dp4a8[];
 extern const char prl_ptx_sm61_noise[], prl_ptx_sm61_dp4a32[], prl_ptx_sm61_dp4a16[], prl_ptx_sm61_dp4a8[];
 extern const char prl_ptx_sm75_mma32[], prl_ptx_sm75_mma16[], prl_ptx_sm75_mma8[];
+extern const char prl_ptx_sm80_fmma32[], prl_ptx_sm80_fmma16[], prl_ptx_sm80_fmma8[];
+extern const char prl_ptx_sm75_fmma32[], prl_ptx_sm75_fmma16[], prl_ptx_sm75_fmma8[];
 
 static const char *ptx_turing_mma(int nt) {
     return nt == 32 ? prl_ptx_sm75_mma32 : nt == 16 ? prl_ptx_sm75_mma16 : prl_ptx_sm75_mma8;
 }
+static const char *ptx_fused(bool sm80, int nt) {
+    if (sm80) return nt == 32 ? prl_ptx_sm80_fmma32 : nt == 16 ? prl_ptx_sm80_fmma16 : prl_ptx_sm80_fmma8;
+    return nt == 32 ? prl_ptx_sm75_fmma32 : nt == 16 ? prl_ptx_sm75_fmma16 : prl_ptx_sm75_fmma8;
+}
+
+int g_fused_mode = 0;
 
 static const char *ptx_for(bool sm80, const char *kind) {
     static const struct { const char *k; const char *p80, *p61; } T[] = {
@@ -37,6 +45,7 @@ static const char *ptx_for(bool sm80, const char *kind) {
 #define APPLY_ROWS 16
 #define APPLY_SMEM(k) (2 * (k) + APPLY_ROWS * 128)
 #define CAND_WORDS (4 + 4 * CAND_CAP)
+#define FUSED_SMEM (128 * 128)
 
 volatile int g_benchmark;
 
@@ -45,9 +54,9 @@ struct gpu_dev {
     gpu_info info;
     CUcontext ctx;
     CUstream st;
-    CUfunction f_uni, f_perm, f_apply, f_mine;
-    unsigned smem;
-    bool mma;
+    CUfunction f_uni, f_perm, f_apply, f_mine, f_fused;
+    unsigned smem, smem_fused;
+    bool mma, use_fused;
     int m, geom;
     pthread_t th;
 };
@@ -113,13 +122,14 @@ typedef struct {
 
 // out = base (+ nonce patch) + noise(label, seed) for `rows` rows of length k
 static CUresult run_noise(gpu_dev *d, noise_bufs *b, unsigned label, unsigned rows, unsigned k, uint64_t nonce,
-                          unsigned patch) {
+                          unsigned patch, bool apply) {
     CUresult r;
     unsigned nblocks = rows * 4;
     void *a1[] = {&b->seed, &label, &nblocks, &b->uni};
     if ((r = launch(d, d->f_uni, (nblocks + 255) / 256, 1, 0, a1))) return r;
     void *a2[] = {&b->seed, &label, &k, &b->pairs};
     if ((r = launch(d, d->f_perm, (k / 8 + 255) / 256, 1, 0, a2))) return r;
+    if (!apply) return 0;
     unsigned lo = (unsigned)nonce, hi = (unsigned)(nonce >> 32);
     void *a3[] = {&b->base, &b->uni, &b->pairs, &b->out, &rows, &k, &lo, &hi, &patch};
     return launch(d, d->f_apply, (rows + APPLY_ROWS - 1) / APPLY_ROWS, 1, APPLY_SMEM(k), a3);
@@ -132,9 +142,18 @@ static CUresult run_mine(gpu_dev *d, CUfunction f, unsigned smem, CUdeviceptr An
     return launch(d, f, n / BN, m / BM, smem, args);
 }
 
+// fused: A' generated in the kernel from the uniform rows + pairs (base A must be zero)
+static CUresult run_mine_fused(gpu_dev *d, CUfunction f, unsigned smem, CUdeviceptr U, CUdeviceptr P, uint64_t nonce,
+                               CUdeviceptr Bn, unsigned m, unsigned n, unsigned k, CUdeviceptr seed, CUdeviceptr bound,
+                               CUdeviceptr cand, CUdeviceptr dbg) {
+    unsigned cap = CAND_CAP, lo = (unsigned)nonce, hi = (unsigned)(nonce >> 32);
+    void *args[] = {&U, &P, &lo, &hi, &Bn, &m, &n, &k, &seed, &bound, &cand, &cap, &dbg};
+    return launch(d, f, n / BN, m / BM, smem, args);
+}
+
 // ------------------------------------------------------------------ self-test
 // Small problem (m=128, n=256, k=2048): GPU noise + transcripts must match the CPU core bit-for-bit.
-static int selftest_kernel(gpu_dev *d, CUfunction fmine, unsigned smem, const char *name) {
+static int selftest_kernel(gpu_dev *d, CUfunction fmine, unsigned smem, const char *name, bool fused) {
     const unsigned m = 128, n = 256, k = 2048;
     const int nt = g_miner.nt;
     int ok = 0;
@@ -146,6 +165,7 @@ static int selftest_kernel(gpu_dev *d, CUfunction fmine, unsigned smem, const ch
     uint8_t sa[32], sb[32];
     uint64_t s = 0x1234567 + d->idx;
     for (unsigned i = 0; i < m * k; i++) { s = s * 6364136223846793005ULL + 1; A[i] = (int8_t)((int)((s >> 33) % 129) - 64); }
+    if (fused) memset(A, 0, m * k);   // fused kernels assume a zero base A (as the miner uses)
     for (unsigned i = 0; i < n * k; i++) { s = s * 6364136223846793005ULL + 1; Bt[i] = (int8_t)((int)((s >> 33) % 129) - 64); }
     for (int i = 0; i < 32; i++) { s = s * 6364136223846793005ULL + 1; sa[i] = (uint8_t)(s >> 40); sb[i] = (uint8_t)(s >> 48); }
     uint64_t nonce = 0x0f1e2d3c4b5a6978ULL;
@@ -159,8 +179,8 @@ static int selftest_kernel(gpu_dev *d, CUfunction fmine, unsigned smem, const ch
     CK(cu.MemcpyHtoD(dSa, sa, 32)); CK(cu.MemcpyHtoD(dSb, sb, 32));
     {
         noise_bufs na = {dA, dUa, dPa, dAn, dSa}, nb = {dB, dUb, dPb, dBn, dSb};
-        CK(run_noise(d, &na, 0, m, k, nonce, 1));
-        CK(run_noise(d, &nb, 1, n, k, 0, 0));
+        CK(run_noise(d, &na, 0, m, k, nonce, 1, true));
+        CK(run_noise(d, &nb, 1, n, k, 0, 0, true));
     }
     CK(cu.StreamSynchronize(d->st));
     CK(cu.MemcpyDtoH(An, dAn, m * k));
@@ -192,7 +212,8 @@ static int selftest_kernel(gpu_dev *d, CUfunction fmine, unsigned smem, const ch
         memset(bound, 0xff, sizeof bound);
         CK(cu.MemcpyHtoD(dBound, bound, 32));
         CK(cu.MemsetD32Async(dCand, 0, CAND_WORDS, d->st));
-        CK(run_mine(d, fmine, smem, dAn, dBn, m, n, k, dSa, dBound, dCand, dDbg));
+        if (fused) CK(run_mine_fused(d, fmine, smem, dUa, dPa, nonce, dBn, m, n, k, dSa, dBound, dCand, dDbg));
+        else CK(run_mine(d, fmine, smem, dAn, dBn, m, n, k, dSa, dBound, dCand, dDbg));
         CK(cu.StreamSynchronize(d->st));
         CK(cu.MemcpyDtoH(dbg, dDbg, ntiles * 64));
         CK(cu.MemcpyDtoH(cand, dCand, CAND_WORDS * 4));
@@ -278,9 +299,26 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
             CK(cu.ModuleGetFunction(&fm, mm, fname));
             if (smem_mma > 48 * 1024)
                 CK(cu.FuncSetAttribute(fm, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_mma));
-            if (selftest_kernel(d, fm, smem_mma, "tensor-core")) {
+            if (selftest_kernel(d, fm, smem_mma, "tensor-core", false)) {
                 d->f_mine = fm; d->smem = smem_mma; d->mma = true; done = true;
             } else LOGW("GPU%d: tensor-core kernel failed the self-test, falling back to dp4a", stat_idx);
+            if (done && g_fused_mode >= 0) {   // fused-noise variant of the same kernel
+                CUmodule mf;
+                CUfunction ff;
+                unsigned smem_f = smem_mma + FUSED_SMEM;
+                snprintf(kn, sizeof kn, "fmma%d", g_miner.nt);
+                snprintf(fname, sizeof fname, "k_mine_fmma_nt%d", g_miner.nt);
+                if (!load_module(d, &mf, ptx_fused(sm80, g_miner.nt), kn) && !cu.ModuleGetFunction(&ff, mf, fname) &&
+                    !cu.FuncSetAttribute(ff, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_f) &&
+                    selftest_kernel(d, ff, smem_f, "fused", true)) {
+                    d->f_fused = ff; d->smem_fused = smem_f;
+                    int regs = 0, lmem = 0;
+                    cu.FuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, ff);
+                    cu.FuncGetAttribute(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, ff);
+                    LOGI("GPU%d: kernel fmma-nt%d (fused noise): %d registers, %d bytes local memory (spills)", stat_idx,
+                         g_miner.nt, regs, lmem);
+                } else LOGW("GPU%d: fused-noise kernel unavailable (load or self-test failed), using the classic one", stat_idx);
+            }
         }
         if (!done) {
             CUmodule md;
@@ -291,7 +329,7 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
             CK(cu.ModuleGetFunction(&fd, md, fname));
             if (smem_dp4a > 48 * 1024)
                 CK(cu.FuncSetAttribute(fd, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_dp4a));
-            if (selftest_kernel(d, fd, smem_dp4a, "dp4a")) { d->f_mine = fd; d->smem = smem_dp4a; d->mma = false; }
+            if (selftest_kernel(d, fd, smem_dp4a, "dp4a", false)) { d->f_mine = fd; d->smem = smem_dp4a; d->mma = false; }
             else { LOGE("GPU%d: all kernels failed the self-test, device disabled", stat_idx); goto fail; }
         }
         int regs = 0, lmem = 0;
@@ -398,12 +436,12 @@ static void *gpu_main(void *arg) {
         uint32_t zero[8] = {0};
         CKF(cu.MemcpyHtoD(dBound, zero, 32));
         noise_bufs nb = {dB, dUb, dPb, dBn, slots[0].dseed};
-        CKF(run_noise(d, &nb, 1, n, k, 0, 0));
+        CKF(run_noise(d, &nb, 1, n, k, 0, 0, true));
         float tn = 0, tg = 0;
         for (int it = 0; it < 3; it++) {
             noise_bufs na = {dA, dUa, dPa, dAn, slots[0].dseed};
             CKF(cu.EventRecord(e0, d->st));
-            CKF(run_noise(d, &na, 0, m, k, 1, 1));
+            CKF(run_noise(d, &na, 0, m, k, 1, 1, true));
             CKF(cu.EventRecord(e1, d->st));
             CKF(run_mine(d, d->f_mine, d->smem, dAn, dBn, m, n, k, slots[0].dseed, dBound, slots[0].dcand, 0));
             CKF(cu.EventRecord(e2, d->st));
@@ -414,6 +452,30 @@ static void *gpu_main(void *arg) {
         char b1[32];
         LOGI("GPU%d: profile: attempt %.2f ms = noise %.2f ms + GEMM %.2f ms; GEMM alone %sH/s", d->idx, tn + tg, tn,
              tg, fmt_rate(tg > 0 ? (double)m * n * k / (tg * 1e-3) : 0, b1, sizeof b1));
+        if (d->f_fused) {
+            float tf = 0, tfs = 0, tfn = 0;
+            for (int it = 0; it < 3; it++) {
+                noise_bufs na = {dA, dUa, dPa, dAn, slots[0].dseed};
+                CKF(cu.EventRecord(e0, d->st));
+                CKF(run_noise(d, &na, 0, m, k, 1, 1, false));
+                CKF(cu.EventRecord(e1, d->st));
+                CKF(run_mine_fused(d, d->f_fused, d->smem_fused, dUa, dPa, 1, dBn, m, n, k, slots[0].dseed, dBound,
+                                   slots[0].dcand, 0));
+                CKF(cu.EventRecord(e2, d->st));
+                CKF(cu.EventSynchronize(e2));
+                cu.EventElapsedTime(&tfn, e0, e1);
+                cu.EventElapsedTime(&tf, e1, e2);
+                tfs = tfn + tf;
+            }
+            d->use_fused = g_fused_mode > 0 || tfs < tn + tg;
+            char b2[32];
+            LOGI("GPU%d: profile: fused attempt %.2f ms (%sH/s) vs classic %.2f ms (%sH/s) -> using %s kernel", d->idx,
+                 tfs, fmt_rate(tfs > 0 ? (double)m * n * k / (tfs * 1e-3) : 0, b1, sizeof b1), tn + tg,
+                 fmt_rate(tn + tg > 0 ? (double)m * n * k / ((tn + tg) * 1e-3) : 0, b2, sizeof b2),
+                 d->use_fused ? "fused" : "classic");
+            if (d->use_fused)
+                snprintf(M->dev[d->idx].kernel, sizeof M->dev[d->idx].kernel, "fmma-nt%d", M->nt);
+        }
     }
     M->dev[d->idx].active = 1;
     uint8_t last_bseed[32];
@@ -427,7 +489,7 @@ static void *gpu_main(void *arg) {
             memcpy(hb, job->work->b_seed, 32);
             CKF(cu.MemcpyHtoDAsync(dSb, hb, 32, d->st));
             noise_bufs nb = {dB, dUb, dPb, dBn, dSb};
-            CKF(run_noise(d, &nb, 1, n, k, 0, 0));
+            CKF(run_noise(d, &nb, 1, n, k, 0, 0, true));
             memcpy(last_bseed, job->work->b_seed, 32);
             have_b = 1;
         }
@@ -445,8 +507,12 @@ static void *gpu_main(void *arg) {
             CKF(cu.MemcpyHtoDAsync(s->dseed, s->hseed, 32, d->st));
             CKF(cu.MemsetD32Async(s->dcand, 0, 4, d->st));
             noise_bufs na = {dA, dUa, dPa, dAn, s->dseed};
-            CKF(run_noise(d, &na, 0, m, k, s->nonce, 1));
-            CKF(run_mine(d, d->f_mine, d->smem, dAn, dBn, m, n, k, s->dseed, dBound, s->dcand, 0));
+            CKF(run_noise(d, &na, 0, m, k, s->nonce, 1, !d->use_fused));
+            if (d->use_fused)
+                CKF(run_mine_fused(d, d->f_fused, d->smem_fused, dUa, dPa, s->nonce, dBn, m, n, k, s->dseed, dBound,
+                                   s->dcand, 0));
+            else
+                CKF(run_mine(d, d->f_mine, d->smem, dAn, dBn, m, n, k, s->dseed, dBound, s->dcand, 0));
             CKF(cu.MemcpyDtoHAsync(s->hcand, s->dcand, CAND_WORDS * 4, d->st));
             CKF(cu.EventRecord(s->ev, d->st));
             s->busy = 1;

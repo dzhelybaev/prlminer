@@ -24,6 +24,8 @@ static uint32_t rng_state = 99;
 static int8_t rnd_val() { rng_state = rng_state * 1664525u + 1013904223u; return (int8_t)((int)((rng_state >> 16) % 129) - 64); }
 
 typedef void (*mine_fn)(const i8 *, const i8 *, u32, u32, u32, const u32 *, const u32 *, u32 *, u32, u32 *);
+typedef void (*fmine_fn)(const i8 *, const u8 *, u32, u32, const i8 *, u32, u32, u32, const u32 *, const u32 *, u32 *,
+                         u32, u32 *);
 
 static void run_mine(mine_fn fn, const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 *seed, const u32 *bound,
                      u32 *cand, u32 cap, u32 *dbg) {
@@ -68,9 +70,25 @@ static void test_noise() {
     printf("noise kernels ok\n");
 }
 
-static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k) {
-    std::vector<i8> A(m * k), Bt(n * k);
+static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k, fmine_fn ffn = nullptr) {
+    std::vector<i8> A(m * k), Bt(n * k), U(m * 128);
+    std::vector<u8> P(2 * k);
+    const uint64_t nonce = 0x0123456789abcdefULL ^ ((uint64_t)m << 40);
     for (auto &v : A) v = (i8)(rnd_val() * 2 - (rnd_val() & 1));   // full noised range
+    if (ffn) {   // fused: A' = nonce patch (row 0) + U[r][first] - U[r][second], base A = 0
+        for (auto &v : U) v = (i8)((rnd_val() & 63) - 32);
+        for (u32 l = 0; l < k; l++) {
+            u32 f = (u32)(rnd_val() & 127), sc = f ^ (1 + (u32)(rnd_val() & 63) % 127);
+            P[2 * l] = (u8)f; P[2 * l + 1] = (u8)(sc & 127);
+        }
+        std::vector<i8> nz(k);
+        for (u32 r = 0; r < m; r++) {
+            std::vector<i8> b(k, 0);
+            if (r == 0) prl_apply_nonce((int8_t *)b.data(), nonce);
+            prl_noise_row((const int8_t *)&U[r * 128], P.data(), k, (int8_t *)nz.data());
+            for (u32 l = 0; l < k; l++) A[r * k + l] = (i8)(b[l] + nz[l]);
+        }
+    }
     for (auto &v : Bt) v = (i8)(rnd_val() * 2 - (rnd_val() & 1));
     uint8_t seed[32];
     for (int i = 0; i < 32; i++) seed[i] = (uint8_t)(rnd_val() + 64);
@@ -107,7 +125,13 @@ static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k)
     u256 bound;
     u256_from_le_bytes(&bound, le.data());
     std::vector<u32> dbg(ntiles * 16, 0xdeadbeef), cand(4 + 4 * 64, 0);
-    run_mine(fn, A.data(), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64, dbg.data());
+    if (ffn)
+        emu_launch(n / BN, m / BM, NTHREADS, STAGES * STAGE_BYTES + FUSED_SMEM, [&]() {
+            ffn(U.data(), P.data(), (u32)nonce, (u32)(nonce >> 32), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64,
+                dbg.data());
+        });
+    else
+        run_mine(fn, A.data(), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64, dbg.data());
     int bad = 0;
     for (u32 i = 0; i < ntiles * 16; i++) bad += dbg[i] != ref[i];
     CHECK(bad == 0, "%s m=%u n=%u: %d transcript words differ", name, m, n, bad);
@@ -131,6 +155,9 @@ int main() {
     test_mine("k_mine_dp4a_nt8", k_mine_dp4a_nt8, 8, 128, 256, 2048);
     test_mine("k_mine_mma_nt32", k_mine_mma_nt32, 32, 256, 512, 4096);   // multi-block, 2 transcript cycles
     test_mine("k_mine_mma_nt8", k_mine_mma_nt8, 8, 256, 512, 2048);
+    test_mine("k_mine_fmma_nt32", nullptr, 32, 128, 256, 2048, k_mine_fmma_nt32);
+    test_mine("k_mine_fmma_nt16", nullptr, 16, 256, 256, 2048, k_mine_fmma_nt16);
+    test_mine("k_mine_fmma_nt8", nullptr, 8, 128, 512, 4096, k_mine_fmma_nt8);
     if (fails) { printf("%d FAILURES\n", fails); return 1; }
     printf("ALL KERNEL EMULATION TESTS PASSED\n");
     return 0;

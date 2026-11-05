@@ -130,9 +130,18 @@ KERNEL void k_apply_noise(const i8 *base, const i8 *uni, const u8 *pairs, i8 *ou
 // grid: (n/BN, m/BM), block 256. A: m x k (noised), Bt: n x k (noised).
 // For every hash tile: transcript over k/128 chunks, H = B3_keyed(seed_a, transcript),
 // H (LE u256) <= bound -> candidate. dbg (optional): all transcripts, 16 words per tile.
-template <int MT, int NT, bool USE_MMA>
-DEVINL void mine_body(const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 *seed8, const u32 *bound8,
-                      u32 *cand, u32 cand_cap, u32 *dbg) {
+//
+// FUSED: A is not read from memory. The base A is all zero except the nonce nibbles in row 0
+// (bytes 0..15), so A'[r][l] = nonce(r,l) + U[r][first_l] - U[r][second_l] is generated straight
+// into shared memory from the block's 128 uniform rows U (staged transposed, 16 KB) and the
+// permutation pairs P. Fused A tiles use a 32-byte row stride with an XOR word swizzle
+// (conflict-free mma fragment loads). Extra dynamic smem: FUSED_SMEM bytes.
+#define FUSED_SMEM (128 * 128)
+DEVINL u32 a_swz(u32 row) { return (((row >> 2) & 1u) << 2) | ((row >> 3) & 3u); }
+
+template <int MT, int NT, bool USE_MMA, bool FUSED>
+DEVINL void mine_body(const i8 *A, const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n,
+                      u32 k, const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
     constexpr int WARPS_N = BN / (8 * NT);
     DYN_SMEM(smem);
     const u32 tid = TID_X, lane = tid & 31, warp = tid >> 5;
@@ -152,9 +161,62 @@ DEVINL void mine_body(const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 
     }
 
     const u32 nk = k / BK;
+    u32 *ELt = (u32 *)(smem + STAGES * STAGE_BYTES);   // FUSED: ELt[f*32 + rg] = U[4rg+j][f], j = byte
+    const u32 *P32 = (const u32 *)P;
+    u32 pw0 = 0, pw1 = 0, gen_kt = 0;   // FUSED: pairs of the next k-step to generate
+    if constexpr (FUSED) {
+        const u32 fb = warp * 16;
+        u32 x[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const u32 *src = (const u32 *)(U + (u64)(row0 + 4 * lane + j) * 128 + fb);
+#pragma unroll
+            for (int w = 0; w < 4; w++) x[j][w] = src[w];
+        }
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            u32 y[4];
+            transpose4(x[0][w], x[1][w], x[2][w], x[3][w], y);
+#pragma unroll
+            for (int i = 0; i < 4; i++) ELt[(fb + 4 * w + i) * 32 + lane] = y[i];
+        }
+        pw0 = P32[2 * warp];
+        pw1 = P32[2 * warp + 1];
+        BAR_SYNC();
+    }
+    // FUSED: warp w generates lines 4w..4w+3 of the k-step for rows 4*lane..4*lane+3
+    auto gen_stage = [&](u32 st) {
+        u8 *As = smem + st * STAGE_BYTES;
+        u32 wv[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            u32 pw = i < 2 ? pw0 : pw1;
+            u32 f = (pw >> (16 * (i & 1))) & 0xffu, sc = (pw >> (16 * (i & 1) + 8)) & 0xffu;
+            wv[i] = bsub4(ELt[f * 32 + lane], ELt[sc * 32 + lane]);
+        }
+        u32 r[4];
+        transpose4(wv[0], wv[1], wv[2], wv[3], r);
+        if (row0 == 0 && gen_kt == 0 && lane == 0 && warp < 4) {   // nonce nibbles 4w..4w+3 of row 0
+            u32 v = ((warp < 2 ? nlo : nhi) >> (16 * (warp & 1))) & 0xffffu;
+            u32 nw = (v & 15u) | ((v >> 4) & 15u) << 8 | ((v >> 8) & 15u) << 16 | ((v >> 12) & 15u) << 24;
+            r[0] = badd4(r[0], nw);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            u32 row = 4 * lane + j;
+            ((u32 *)(As + row * 32))[warp ^ a_swz(row)] = r[j];
+        }
+        gen_kt++;
+        if (gen_kt < nk) {
+            pw0 = P32[gen_kt * 16 + 2 * warp];
+            pw1 = P32[gen_kt * 16 + 2 * warp + 1];
+        }
+    };
     auto load_stage = [&](u32 st, u32 kt) {
         u8 *As = smem + st * STAGE_BYTES, *Bs = As + BM * SROW;
-        {   // A: 128 rows x 2 segments
+        if constexpr (FUSED) {
+            gen_stage(st);
+        } else {   // A: 128 rows x 2 segments
             u32 r = tid >> 1, s = tid & 1;
             cp_async16(As + r * SROW + 16 * s, A + (u64)(row0 + r) * k + kt * BK + 16 * s);
         }
@@ -182,11 +244,20 @@ DEVINL void mine_body(const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 
             u32 af[MT][4];
 #pragma unroll
             for (int a = 0; a < MT; a++) {
-                const u8 *ra = As + (wrow + 16 * a + g) * SROW + 4 * q;
-                af[a][0] = *(const u32 *)(ra);
-                af[a][1] = *(const u32 *)(ra + 8 * SROW);
-                af[a][2] = *(const u32 *)(ra + 16);
-                af[a][3] = *(const u32 *)(ra + 8 * SROW + 16);
+                if constexpr (FUSED) {
+                    const u32 r0 = wrow + 16 * a + g, r8 = r0 + 8;
+                    const u32 *p0 = (const u32 *)(As + r0 * 32), *p8 = (const u32 *)(As + r8 * 32);
+                    af[a][0] = p0[q ^ a_swz(r0)];
+                    af[a][1] = p8[q ^ a_swz(r8)];
+                    af[a][2] = p0[(q + 4) ^ a_swz(r0)];
+                    af[a][3] = p8[(q + 4) ^ a_swz(r8)];
+                } else {
+                    const u8 *ra = As + (wrow + 16 * a + g) * SROW + 4 * q;
+                    af[a][0] = *(const u32 *)(ra);
+                    af[a][1] = *(const u32 *)(ra + 8 * SROW);
+                    af[a][2] = *(const u32 *)(ra + 16);
+                    af[a][3] = *(const u32 *)(ra + 8 * SROW + 16);
+                }
             }
 #pragma unroll
             for (int b = 0; b < NT; b++) {
@@ -277,23 +348,35 @@ DEVINL void mine_body(const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 
 
 #define MINE_ARGS const i8 *A, const i8 *Bt, u32 m, u32 n, u32 k, const u32 *seed8, const u32 *bound8, \
                   u32 *cand, u32 cand_cap, u32 *dbg
-#define MINE_PASS A, Bt, m, n, k, seed8, bound8, cand, cand_cap, dbg
+#define MINE_PASS A, nullptr, nullptr, 0u, 0u, Bt, m, n, k, seed8, bound8, cand, cand_cap, dbg
+#define FMINE_ARGS const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k, \
+                   const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg
+#define FMINE_PASS nullptr, U, P, nlo, nhi, Bt, m, n, k, seed8, bound8, cand, cand_cap, dbg
 
 #if defined(PRL_EMU) || (PRL_MMA && defined(K_MMA32))
-KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_mma_nt32(MINE_ARGS) { mine_body<1, 32, true>(MINE_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_mma_nt32(MINE_ARGS) { mine_body<1, 32, true, false>(MINE_PASS); }
 #endif
 #if defined(PRL_EMU) || (PRL_MMA && defined(K_MMA16))
-KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_mma_nt16(MINE_ARGS) { mine_body<2, 16, true>(MINE_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_mma_nt16(MINE_ARGS) { mine_body<2, 16, true, false>(MINE_PASS); }
 #endif
 #if defined(PRL_EMU) || (PRL_MMA && defined(K_MMA8))
-KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_mma_nt8(MINE_ARGS)  { mine_body<4, 8, true>(MINE_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_mma_nt8(MINE_ARGS)  { mine_body<4, 8, true, false>(MINE_PASS); }
+#endif
+#if defined(PRL_EMU) || (PRL_MMA && defined(K_FMMA32))
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_fmma_nt32(FMINE_ARGS) { mine_body<1, 32, true, true>(FMINE_PASS); }
+#endif
+#if defined(PRL_EMU) || (PRL_MMA && defined(K_FMMA16))
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_fmma_nt16(FMINE_ARGS) { mine_body<2, 16, true, true>(FMINE_PASS); }
+#endif
+#if defined(PRL_EMU) || (PRL_MMA && defined(K_FMMA8))
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_fmma_nt8(FMINE_ARGS)  { mine_body<4, 8, true, true>(FMINE_PASS); }
 #endif
 #if defined(PRL_EMU) || defined(K_DP4A32)
-KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt32(MINE_ARGS) { mine_body<1, 32, false>(MINE_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt32(MINE_ARGS) { mine_body<1, 32, false, false>(MINE_PASS); }
 #endif
 #if defined(PRL_EMU) || defined(K_DP4A16)
-KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt16(MINE_ARGS) { mine_body<2, 16, false>(MINE_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt16(MINE_ARGS) { mine_body<2, 16, false, false>(MINE_PASS); }
 #endif
 #if defined(PRL_EMU) || defined(K_DP4A8)
-KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt8(MINE_ARGS)  { mine_body<4, 8, false>(MINE_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_mine_dp4a_nt8(MINE_ARGS)  { mine_body<4, 8, false, false>(MINE_PASS); }
 #endif
