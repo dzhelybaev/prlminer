@@ -25,6 +25,7 @@ typedef unsigned long long u64;
 #define TID_X  ((u32)__nvvm_read_ptx_sreg_tid_x())
 #define BID_X  ((u32)__nvvm_read_ptx_sreg_ctaid_x())
 #define BID_Y  ((u32)__nvvm_read_ptx_sreg_ctaid_y())
+#define BID_Z  ((u32)__nvvm_read_ptx_sreg_ctaid_z())
 #define DYN_SMEM(name) extern __shared__ __attribute__((aligned(16))) u8 name[]
 #define BAR_SYNC() __syncthreads()
 
@@ -131,6 +132,7 @@ DEVINL void mma_s8(i32 d[4], const u32 a[4], const u32 b[2]) { __builtin_trap();
 #define TID_X  (emu_tid())
 #define BID_X  (emu_bid_x())
 #define BID_Y  (emu_bid_y())
+#define BID_Z  (emu_bid_z())
 #define DYN_SMEM(name) u8 *name = emu_smem()
 #define BAR_SYNC() emu_bar_sync()
 DEVINL void cp_async16(void *dst, const void *src) { __builtin_memcpy(dst, src, 16); }

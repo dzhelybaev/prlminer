@@ -6,7 +6,7 @@
 
 #define MAX_DEV   32
 #define MAX_POOLS 8
-#define PRL_VERSION "1.0.16"
+#define PRL_VERSION "1.0.17"
 #define PRL_AGENT   "ejjjminer/" PRL_VERSION
 
 typedef struct {
@@ -101,6 +101,7 @@ uint64_t miner_seq(void);                 // changes whenever the current job ch
 job_t *miner_wait_job(double timeout_s);  // ref'd current job, or NULL on timeout/quit
 void job_release(job_t *j);
 uint64_t miner_next_nonce(void);
+uint64_t miner_next_nonces(unsigned count);   // first of `count` consecutive nonces
 void miner_candidate(job_t *j, int geom, int dev, uint64_t nonce, uint32_t t_rows, uint32_t t_cols);
 void miner_attempt_chunk0(const work_t *w, int geom, uint64_t nonce, uint8_t chunk0[PRL_CHUNK],
                           uint8_t a_seed[32]);

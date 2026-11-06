@@ -24,12 +24,14 @@
 #define STAGES 2         // sm_61/sm_75: synchronous copies, 48 KB shared memory
 #endif
 #define STAGE_BYTES ((BM + BN) * SROW)
-#define NCAND_WORDS 4    // candidate record: t_rows, t_cols, hash word 7, hash word 6
+#define NCAND_WORDS 4    // candidate record: t_rows, t_cols, hash word 7, nonce index in the batch (BID_Z)
 
 // ------------------------------------------------------------------ noise generation
 #if defined(PRL_EMU) || defined(K_NOISE)
 // uniform: out[idx*32 + i] = (H(idx)[i] & 63) - 32, H(idx) = B3_keyed(key, [1+idx,0..0 | label])
 KERNEL void k_noise_uniform(const u32 *key8, u32 label_b, u32 nblocks, i8 *out) {
+    key8 += 8 * BID_Z;                     // batch: one key / one output buffer per nonce
+    out += (u64)BID_Z * nblocks * 32;
     u32 idx = BID_X * NTHREADS + TID_X;
     if (idx >= nblocks) return;
     u32 key[8], m[16], h[8];
@@ -53,6 +55,8 @@ KERNEL void k_noise_uniform(const u32 *key8, u32 label_b, u32 nblocks, i8 *out) 
 
 // permutation pairs: line l = 8i + j uses word j of H(i) with slot 1
 KERNEL void k_noise_perm(const u32 *key8, u32 label_b, u32 k, u8 *pairs) {
+    key8 += 8 * BID_Z;
+    pairs += (u64)BID_Z * 2 * k;
     u32 i = BID_X * NTHREADS + TID_X;
     if (i * 8 >= k) return;
     u32 key[8], m[16], h[8];
@@ -84,6 +88,15 @@ KERNEL void k_noise_perm(const u32 *key8, u32 label_b, u32 k, u8 *pairs) {
 KERNEL void k_apply_noise(const i8 *base, const i8 *uni, const u8 *pairs, i8 *out, u32 rows, u32 k,
                           u32 nonce_lo, u32 nonce_hi, u32 patch) {
     DYN_SMEM(sm);
+    {   // batch: nonce index z gets its own uniform rows / pairs / output, nonce + z
+        const u32 z = BID_Z;
+        uni += (u64)z * rows * 128;
+        pairs += (u64)z * 2 * k;
+        out += (u64)z * rows * k;
+        const u64 nn = (((u64)nonce_hi << 32) | nonce_lo) + z;
+        nonce_lo = (u32)nn;
+        nonce_hi = (u32)(nn >> 32);
+    }
     u8 *sp = sm;                       // 2k bytes
     i8 *su = (i8 *)(sm + 2 * k);       // APPLY_ROWS x 128
     const u32 tid = TID_X, r0 = BID_X * APPLY_ROWS;
@@ -125,6 +138,60 @@ KERNEL void k_apply_noise(const i8 *base, const i8 *uni, const u8 *pairs, i8 *ou
     }
 }
 
+// ------------------------------------------------------------------ per-nonce seeds on the GPU
+// ctx (words): [0..7] job_key, [8..15] b_seed, [16..23] seed salt A, [24] m, [25] salted, [26] nlayers,
+// [32..287] chunk 0 of the base A (256 words), [288 + 8*l ..] sibling (index 1) of tree layer l.
+// One thread per nonce: chunk-0 CV with the nonce nibbles, Merkle path to the root of A, seed binding,
+// a_seed = BLAKE3(b_seed || bind_a(root, m)) — identical to miner_attempt_chunk0 on the CPU.
+#define SEEDCTX_WORDS (288 + 8 * 48)
+KERNEL void k_seeds(const u32 *ctx, u32 nonce_lo, u32 nonce_hi, u32 count, u32 *out) {
+    const u32 z = BID_X * NTHREADS + TID_X;
+    if (z >= count) return;
+    const u64 nn = (((u64)nonce_hi << 32) | nonce_lo) + z;
+    u32 key[8], cv[8], m[16], h[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) key[i] = cv[i] = ctx[i];
+    for (int b = 0; b < 16; b++) {   // chunk 0: 16 blocks of 64 bytes, nonce nibbles in bytes 0..15
+#pragma unroll
+        for (int i = 0; i < 16; i++) m[i] = ctx[32 + 16 * b + i];
+        if (b == 0) {
+#pragma unroll
+            for (int w = 0; w < 4; w++) {
+                u32 v = (u32)(nn >> (16 * w)) & 0xffffu;
+                m[w] = (v & 15u) | ((v >> 4) & 15u) << 8 | ((v >> 8) & 15u) << 16 | ((v >> 12) & 15u) << 24;
+            }
+        }
+        u32 fl = B3_KEYED | (b == 0 ? B3_CHUNK_START : 0u) | (b == 15 ? B3_CHUNK_END : 0u);
+        b3_compress(cv, m, fl, h);
+#pragma unroll
+        for (int i = 0; i < 8; i++) cv[i] = h[i];
+    }
+    const u32 nl = ctx[26];
+    for (u32 l = 1; l < nl; l++) {   // path of chunk 0: node(l) = parent(node(l-1), sibling(l-1))
+#pragma unroll
+        for (int i = 0; i < 8; i++) { m[i] = cv[i]; m[8 + i] = ctx[288 + 8 * (l - 1) + i]; }
+        b3_compress(key, m, B3_KEYED | B3_PARENT | (l == nl - 1 ? B3_ROOT : 0u), h);
+#pragma unroll
+        for (int i = 0; i < 8; i++) cv[i] = h[i];
+    }
+    if (ctx[25]) {   // salted: bind_root(root, m) = keyed(salt_a, root || m_le32 || 0...)
+        u32 salt[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) { salt[i] = ctx[16 + i]; m[i] = cv[i]; m[8 + i] = 0; }
+        m[8] = ctx[24];
+        b3_keyed64(salt, m, h);
+#pragma unroll
+        for (int i = 0; i < 8; i++) cv[i] = h[i];
+    }
+    const u32 iv[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                       0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
+#pragma unroll
+    for (int i = 0; i < 8; i++) { m[i] = ctx[8 + i]; m[8 + i] = cv[i]; }
+    b3_compress(iv, m, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT, h);
+#pragma unroll
+    for (int i = 0; i < 8; i++) out[8 * z + i] = h[i];
+}
+
 #endif  // K_NOISE
 
 // ------------------------------------------------------------------ fused mining kernel
@@ -145,6 +212,15 @@ DEVINL void mine_body(const i8 *A, const i8 *U, const u8 *P, u32 nlo, u32 nhi, c
                       u32 k, const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
     constexpr int WARPS_N = BN / (8 * NT);
     DYN_SMEM(smem);
+    if constexpr (FUSED) {   // batch: nonce index z (grid z) has its own uniform rows, pairs, seed and nonce
+        const u32 z = BID_Z;
+        U += (u64)z * m * 128;
+        P += (u64)z * 2 * k;
+        seed8 += 8 * z;
+        const u64 nn = (((u64)nhi << 32) | nlo) + z;
+        nlo = (u32)nn;
+        nhi = (u32)(nn >> 32);
+    }
     const u32 tid = TID_X, lane = tid & 31, warp = tid >> 5;
     const u32 g = lane >> 2, q = lane & 3;
     const u32 wm = warp / WARPS_N, wn = warp % WARPS_N;
@@ -341,7 +417,7 @@ DEVINL void mine_body(const i8 *A, const i8 *U, const u8 *P, u32 nlo, u32 nhi, c
             u32 slot = atomic_add_u32(cand, 1u);
             if (slot < cand_cap) {
                 u32 *c = cand + 4 + NCAND_WORDS * slot;
-                c[0] = t_rows; c[1] = t_cols; c[2] = h[7]; c[3] = h[6];
+                c[0] = t_rows; c[1] = t_cols; c[2] = h[7]; c[3] = BID_Z;
             }
         }
     }
@@ -406,6 +482,15 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     constexpr u32 ELT = STG * STAGE, JPO = ELT + 128 * 128;   // byte offsets of ELt and the transcript words
     constexpr u32 XSO = JPO + 64 * JS * NOWN;                 // HS = 2: partner XOR exchange (MT words / owner)
     DYN_SMEM(smem);
+    {   // batch: nonce index z (grid z): own seed, nonce, uniform rows + pairs (GEN) or A' (L2)
+        const u32 z = BID_Z;
+        U += GEN ? (u64)z * m * 128 : (u64)z * m * k;
+        P += (u64)z * 2 * k;
+        seed8 += 8 * z;
+        const u64 nn = (((u64)nhi << 32) | nlo) + z;
+        nlo = (u32)nn;
+        nhi = (u32)(nn >> 32);
+    }
     const saddr_t sb = sbase(smem);
     const u32 tid = TID_X, lane = tid & 31, warp = tid >> 5;
     const u32 g = lane >> 2, q = lane & 3;
@@ -698,7 +783,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
             u32 slot = atomic_add_u32(cand, 1u);
             if (slot < cand_cap) {
                 u32 *c = cand + 4 + NCAND_WORDS * slot;
-                c[0] = t_rows; c[1] = t_cols; c[2] = h[7]; c[3] = h[6];
+                c[0] = t_rows; c[1] = t_cols; c[2] = h[7]; c[3] = BID_Z;
             }
         }
     }

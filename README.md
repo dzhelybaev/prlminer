@@ -40,7 +40,7 @@ Hash-тайл берётся из официального майнера: rows 
 
 ## Установка в HiveOS
 
-1. Положите `ejjjminer-1.0.16.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
+1. Положите `ejjjminer-1.0.17.tar.gz` туда, откуда риг сможет скачать его по HTTP(S):
    GitHub Releases, свой веб-сервер и т. п.
 2. Создайте полётный лист (Flight Sheet):
    - **Coin**: PRL (или любая, если такой нет);
@@ -51,7 +51,7 @@ Hash-тайл берётся из официального майнера: rows 
 | Поле | Значение |
 |---|---|
 | Miner name | `ejjjminer` |
-| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/ejjjminer-1.0.16.tar.gz` |
+| Installation URL | `https://github.com/dzhelybaev/prlminer/raw/main/dist/ejjjminer-1.0.17.tar.gz` |
 | Hash algorithm | `pearlhash` |
 | Wallet and worker template | `%WAL%.%WORKER_NAME%` |
 | Pool URL | например `pearl-eu2.luckypool.io:3360` (несколько адресов через пробел = резерв) |
@@ -138,7 +138,7 @@ API: `curl http://127.0.0.1:4068/` возвращает JSON с хешрейто
 ```
 make portable        # build/ejjjminer-portable (glibc ≥ 2.17)
 tests/run_all.sh     # все тесты, GPU не нужен
-make package         # build/ejjjminer-1.0.16.tar.gz для HiveOS
+make package         # build/ejjjminer-1.0.17.tar.gz для HiveOS
 ```
 
 ## Лицензии

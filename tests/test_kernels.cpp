@@ -146,7 +146,105 @@ static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k,
     printf("%-18s m=%u n=%u k=%u: %u tiles, transcripts + %d candidates match CPU\n", name, m, n, k, ntiles, want);
 }
 
+static void test_seeds() {
+    const size_t m = 128, k = 2048;
+    std::vector<uint8_t> A(m * k, 0);
+    uint8_t key[32], bs[32];
+    for (int i = 0; i < 32; i++) { key[i] = (uint8_t)(i * 7 + 3); bs[i] = (uint8_t)(200 - i); }
+    prl_tree t;
+    prl_tree_build(&t, A.data(), A.size(), key, 1);
+    for (int salted = 0; salted < 2; salted++) {
+        std::vector<u32> ctx(PRL_SEEDCTX_WORDS), out(8 * 37);
+        CHECK(prl_seed_ctx(&t, A.data(), bs, (uint32_t)m, salted, ctx.data()) == 0, "seed ctx");
+        const uint64_t base = 0x00000005fffffff0ULL;   // crosses a 32-bit boundary inside the batch
+        emu_launch_serial(1, 1, 256, [&]() { k_seeds(ctx.data(), (u32)base, (u32)(base >> 32), 37, out.data()); });
+        int bad = 0;
+        for (int z = 0; z < 37; z++) {
+            uint8_t c0[1024];
+            memcpy(c0, A.data(), 1024);
+            prl_apply_nonce((int8_t *)c0, base + z);
+            prl_path0 p;
+            prl_tree_path0(&t, c0, &p);
+            uint8_t sd[32];
+            prl_seed_a(bs, p.node[p.nlayers - 1], (uint32_t)m, salted, sd);
+            bad += memcmp(sd, &out[8 * z], 32) != 0;
+        }
+        CHECK(bad == 0, "k_seeds salted=%d: %d of 37 seeds differ", salted, bad);
+    }
+    prl_tree_free(&t);
+    printf("seed kernel ok (37 nonces, salted + legacy)\n");
+}
+
+// batch of Z nonces in one launch (grid z): candidate set (t_rows, t_cols, z) must match the CPU
+static void test_batch(const char *name, fmine_fn ffn, int nt, u32 m, u32 n, u32 k, u32 smem, u32 threads, bool l2) {
+    const u32 Z = 3;
+    const uint64_t nonce0 = 0x1122334455667788ULL;
+    std::vector<i8> U(Z * m * 128), Ap(Z * m * k), Bt(n * k);
+    std::vector<u8> P(Z * 2 * k);
+    for (auto &v : U) v = (i8)((rnd_val() & 63) - 32);
+    for (auto &v : Bt) v = (i8)(rnd_val() * 2 - (rnd_val() & 1));
+    for (u32 l = 0; l < Z * k; l++) {
+        u32 f = (u32)(rnd_val() & 127), sc = f ^ (1 + (u32)(rnd_val() & 63) % 127);
+        P[2 * l] = (u8)f; P[2 * l + 1] = (u8)(sc & 127);
+    }
+    uint8_t seeds[3][32];
+    std::vector<u32> sw(8 * Z);
+    for (u32 z = 0; z < Z; z++) {
+        for (int i = 0; i < 32; i++) seeds[z][i] = (uint8_t)(rnd_val() + 64 + z);
+        key_to_words(seeds[z], &sw[8 * z]);
+        std::vector<i8> nz(k);
+        for (u32 r = 0; r < m; r++) {
+            std::vector<i8> b(k, 0);
+            if (r == 0) prl_apply_nonce((int8_t *)b.data(), nonce0 + z);
+            prl_noise_row((const int8_t *)&U[(z * m + r) * 128], &P[z * 2 * k], k, (int8_t *)nz.data());
+            for (u32 l = 0; l < k; l++) Ap[(size_t)z * m * k + (size_t)r * k + l] = (i8)(b[l] + nz[l]);
+        }
+    }
+    prl_geom g;
+    prl_geom_init(&g, m, n, k, nt);
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<u32>>> hs;
+    for (u32 z = 0; z < Z; z++)
+        for (u32 rb = 0; rb < m; rb += 16)
+            for (u32 gg = 0; gg < 8; gg++)
+                for (u32 cb = 0; cb < n; cb += 8 * nt)
+                    for (u32 qq = 0; qq < 4; qq++) {
+                        u32 tr = rb + gg, tc = cb + 2 * qq, rows[2], cols[64], jp[16];
+                        prl_tile_rows(&g, tr, rows);
+                        prl_tile_cols(&g, tc, cols);
+                        const int8_t *ap[2] = {&Ap[(size_t)z * m * k + rows[0] * k], &Ap[(size_t)z * m * k + rows[1] * k]};
+                        const int8_t *bp[64];
+                        for (int j = 0; j < g.w; j++) bp[j] = &Bt[cols[j] * k];
+                        prl_jackpot(ap, 2, bp, g.w, k, 128, jp);
+                        uint8_t h[32];
+                        prl_jackpot_hash(jp, seeds[z], h);
+                        std::vector<uint8_t> be(h, h + 32);
+                        std::reverse(be.begin(), be.end());
+                        hs.push_back({be, {tr, tc, z}});
+                    }
+    std::sort(hs.begin(), hs.end());
+    const int want = 9;
+    std::vector<uint8_t> le(hs[want - 1].first.rbegin(), hs[want - 1].first.rend());
+    u256 bound;
+    u256_from_le_bytes(&bound, le.data());
+    std::vector<u32> cand(4 + 4 * 64, 0);
+    emu_launch3(n / BN, m / BM, Z, threads, smem, [&]() {
+        ffn(l2 ? Ap.data() : U.data(), P.data(), (u32)nonce0, (u32)(nonce0 >> 32), Bt.data(), m, n, k, sw.data(),
+            bound.w, cand.data(), 64, nullptr);
+    });
+    std::vector<std::vector<u32>> got, exp;
+    for (u32 i = 0; i < cand[0] && i < 64; i++) got.push_back({cand[4 + 4 * i], cand[5 + 4 * i], cand[7 + 4 * i]});
+    for (int i = 0; i < want; i++) exp.push_back(hs[i].second);
+    std::sort(got.begin(), got.end());
+    std::sort(exp.begin(), exp.end());
+    CHECK(cand[0] == (u32)want && got == exp, "%s batch: candidate set differs (%u found)", name, cand[0]);
+    printf("%-18s batch of %u nonces: %d candidates (rows, cols, nonce index) match CPU\n", name, Z, want);
+}
+
 int main() {
+    test_batch("k_mine_fmma_nt16", k_mine_fmma_nt16, 16, 128, 256, 2048, STAGES * STAGE_BYTES + FUSED_SMEM, 256, false);
+    test_batch("k_v4c_nt16", k_v4c_nt16, 16, 128, 256, 2048, 131072, 512, false);
+    test_batch("k_l2b_nt16", k_l2b_nt16, 16, 128, 256, 2048, 131072, 256, true);
+    test_seeds();
     test_noise();
     test_mine("k_mine_mma_nt32", k_mine_mma_nt32, 32, 128, 256, 2048);
     test_mine("k_mine_mma_nt16", k_mine_mma_nt16, 16, 128, 256, 2048);

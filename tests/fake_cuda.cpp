@@ -14,9 +14,9 @@ static const char *g_names[] = {"k_noise_uniform", "k_noise_perm", "k_apply_nois
                                 "k_mine_mma_nt16", "k_mine_mma_nt8", "k_mine_dp4a_nt32", "k_mine_dp4a_nt16",
                                 "k_mine_dp4a_nt8", "k_mine_fmma_nt32", "k_mine_fmma_nt16", "k_mine_fmma_nt8",
                                 "k_v2a_nt32", "k_v2b_nt32", "k_v2c_nt32", "k_v2a_nt16", "k_v2b_nt16", "k_v2c_nt16", "k_v3a_nt16", "k_v3b_nt16", "k_v4a_nt16", "k_v4b_nt16", "k_v4c_nt16",
-                                "k_l2a_nt16", "k_l2b_nt16", "k_l3b_nt16", "k_l4c_nt16"};
+                                "k_l2a_nt16", "k_l2b_nt16", "k_l3b_nt16", "k_l4c_nt16", "k_seeds"};
 struct Func { int id; };
-static Func g_funcs[27];
+static Func g_funcs[28];
 
 template <class T> static T A(void **p, int i) { return *(T *)p[i]; }
 
@@ -47,7 +47,7 @@ CUresult cuCtxSetCurrent(void *) { return 0; }
 CUresult cuCtxSynchronize() { return 0; }
 CUresult cuModuleLoadDataEx(void **m, const void *, unsigned, int *, void **) { *m = (void *)1; return 0; }
 CUresult cuModuleGetFunction(void **f, void *, const char *name) {
-    for (int i = 0; i < 27; i++)
+    for (int i = 0; i < 28; i++)
         if (!strcmp(name, g_names[i])) { g_funcs[i].id = i; *f = &g_funcs[i]; return 0; }
     return 500;   // CUDA_ERROR_NOT_FOUND
 }
@@ -75,26 +75,26 @@ CUresult cuEventSynchronize(void *) { return 0; }
 CUresult cuEventElapsedTime(float *t, void *, void *) { *t = 0; return 0; }
 CUresult cuStreamWaitEvent(void *, void *, unsigned) { return 0; }   // fake streams are synchronous
 
-CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned, unsigned bx, unsigned, unsigned, unsigned smem,
+CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned, unsigned, unsigned smem,
                         void *, void **p, void **) {
     int id = ((Func *)f)->id;
     if (bx != 256 && !(bx == 512 && id >= 18)) return 1;   // (L2 kernels: 256 or 512)
     switch (id) {
     case 0: {
         auto key = A<const u32 *>(p, 0); auto lb = A<u32>(p, 1); auto nb = A<u32>(p, 2); auto out = A<i8 *>(p, 3);
-        emu_launch_serial(gx, gy, bx, [&]() { k_noise_uniform(key, lb, nb, out); });
+        emu_launch_serial3(gx, gy, gz, bx, [&]() { k_noise_uniform(key, lb, nb, out); });
         break;
     }
     case 1: {
         auto key = A<const u32 *>(p, 0); auto lb = A<u32>(p, 1); auto k = A<u32>(p, 2); auto out = A<u8 *>(p, 3);
-        emu_launch_serial(gx, gy, bx, [&]() { k_noise_perm(key, lb, k, out); });
+        emu_launch_serial3(gx, gy, gz, bx, [&]() { k_noise_perm(key, lb, k, out); });
         break;
     }
     case 2: {
         auto base = A<const i8 *>(p, 0); auto uni = A<const i8 *>(p, 1); auto pairs = A<const u8 *>(p, 2);
         auto out = A<i8 *>(p, 3); auto rows = A<u32>(p, 4); auto k = A<u32>(p, 5); auto lo = A<u32>(p, 6);
         auto hi = A<u32>(p, 7); auto patch = A<u32>(p, 8);
-        emu_launch(gx, gy, bx, smem, [&]() { k_apply_noise(base, uni, pairs, out, rows, k, lo, hi, patch); });
+        emu_launch3(gx, gy, gz, bx, smem, [&]() { k_apply_noise(base, uni, pairs, out, rows, k, lo, hi, patch); });
         break;
     }
     case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 24: case 25: case 26: {
@@ -110,8 +110,14 @@ CUresult cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned, unsigned bx
         ff fn = fns[id - 9];
         // the emulated kernels use the sm_80 layout; the host may have sized smem for Turing
         unsigned need = id >= 12 ? 131072 : STAGES * STAGE_BYTES + FUSED_SMEM;
-        emu_launch(gx, gy, bx, smem < need ? need : smem,
-                   [&]() { fn(U, P, lo, hi, Bt, m, n, k, seed, bound, cand, cap, dbg); });
+        emu_launch3(gx, gy, gz, bx, smem < need ? need : smem,
+                    [&]() { fn(U, P, lo, hi, Bt, m, n, k, seed, bound, cand, cap, dbg); });
+        break;
+    }
+    case 27: {
+        auto ctx = A<const u32 *>(p, 0); auto lo = A<u32>(p, 1); auto hi = A<u32>(p, 2); auto cnt = A<u32>(p, 3);
+        auto out = A<u32 *>(p, 4);
+        emu_launch_serial3(gx, gy, gz, bx, [&]() { k_seeds(ctx, lo, hi, cnt, out); });
         break;
     }
     default: {

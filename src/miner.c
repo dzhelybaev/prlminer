@@ -292,6 +292,11 @@ job_t *miner_wait_job(double timeout_s) {
     return j;
 }
 
+uint64_t miner_next_nonces(unsigned count) {
+    uint64_t c = atomic_fetch_add(&g_miner.nonce_ctr, count);
+    return (g_miner.nonce_prefix << 32) + c;
+}
+
 uint64_t miner_next_nonce(void) {
     uint64_t c = atomic_fetch_add(&g_miner.nonce_ctr, 1);
     return (g_miner.nonce_prefix << 32) + c;

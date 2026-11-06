@@ -88,6 +88,11 @@ void prl_job_key(const uint8_t header[PRL_HEADER_LEN], const prl_geom *g, uint8_
 void prl_seed_b(const uint8_t job_key[32], const uint8_t hash_b[32], uint32_t n, bool salted, uint8_t out[32]);
 void prl_seed_a(const uint8_t b_seed[32], const uint8_t hash_a[32], uint32_t m, bool salted, uint8_t out[32]);
 
+// GPU seed context (see k_seeds in cuda/kernels.cu): everything needed to derive a_seed for any nonce.
+#define PRL_SEEDCTX_WORDS (288 + 8 * 48)
+int prl_seed_ctx(const prl_tree *ta, const uint8_t chunk0_base[PRL_CHUNK], const uint8_t b_seed[32], uint32_t m,
+                 bool salted, uint32_t ctx[PRL_SEEDCTX_WORDS]);   // 0 ok
+
 // ---------------------------------------------------------------- noise (CPU)
 extern const uint8_t PRL_LABEL_A[32], PRL_LABEL_B[32];
 void prl_noise_hash(uint32_t index, const uint8_t label[32], const uint8_t key[32], int slot, uint8_t out[32]);

@@ -77,7 +77,8 @@ struct gpu_dev {
     gpu_info info;
     CUcontext ctx;
     CUstream st, st2, lst;   // st: GEMM, st2: noise (L2 pipeline), lst: launch-stream override
-    CUfunction f_uni, f_perm, f_apply, f_mine, f_fused;
+    CUfunction f_uni, f_perm, f_apply, f_mine, f_fused, f_seeds;
+    int gpu_seeds;   // k_seeds passed its self-test: batches with seeds derived on the GPU
     unsigned smem, smem_fused;
     bool mma, use_fused;
     struct { CUfunction f; unsigned smem, threads; int l2; char name[16]; } fv[16];   // self-tested variants
@@ -142,6 +143,10 @@ static CUresult launch_t(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, uns
                          void **args) {
     return cu.LaunchKernel(f, gx, gy, 1, threads, 1, 1, smem, d->lst ? d->lst : d->st, args, NULL);
 }
+static CUresult launch3(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsigned gz, unsigned threads,
+                       unsigned smem, void **args) {
+    return cu.LaunchKernel(f, gx, gy, gz, threads, 1, 1, smem, d->lst ? d->lst : d->st, args, NULL);
+}
 static CUresult launch(gpu_dev *d, CUfunction f, unsigned gx, unsigned gy, unsigned smem, void **args) {
     return launch_t(d, f, gx, gy, 256, smem, args);
 }
@@ -166,6 +171,17 @@ static CUresult run_noise(gpu_dev *d, noise_bufs *b, unsigned label, unsigned ro
     return launch(d, d->f_apply, (rows + APPLY_ROWS - 1) / APPLY_ROWS, 1, APPLY_SMEM(k), a3);
 }
 
+// batch of `count` nonces: seeds (8 words each) -> uniform rows (count x rows x 128) + pairs (count x 2k)
+static CUresult run_noise_batch(gpu_dev *d, CUdeviceptr seeds, CUdeviceptr uni, CUdeviceptr pairs, unsigned rows,
+                                unsigned k, unsigned count) {
+    CUresult r;
+    unsigned label = 0, nblocks = rows * 4;
+    void *a1[] = {&seeds, &label, &nblocks, &uni};
+    if ((r = launch3(d, d->f_uni, (nblocks + 255) / 256, 1, count, 256, 0, a1))) return r;
+    void *a2[] = {&seeds, &label, &k, &pairs};
+    return launch3(d, d->f_perm, (k / 8 + 255) / 256, 1, count, 256, 0, a2);
+}
+
 static CUresult run_mine(gpu_dev *d, CUfunction f, unsigned smem, CUdeviceptr An, CUdeviceptr Bn, unsigned m,
                          unsigned n, unsigned k, CUdeviceptr seed, CUdeviceptr bound, CUdeviceptr cand, CUdeviceptr dbg) {
     unsigned cap = CAND_CAP;
@@ -174,12 +190,17 @@ static CUresult run_mine(gpu_dev *d, CUfunction f, unsigned smem, CUdeviceptr An
 }
 
 // fused: A' generated in the kernel from the uniform rows + pairs (base A must be zero)
+static CUresult run_mine_fused_z(gpu_dev *d, CUfunction f, unsigned threads, unsigned smem, CUdeviceptr U,
+                                 CUdeviceptr P, uint64_t nonce, CUdeviceptr Bn, unsigned m, unsigned n, unsigned k,
+                                 CUdeviceptr seed, CUdeviceptr bound, CUdeviceptr cand, CUdeviceptr dbg, unsigned count) {
+    unsigned cap = CAND_CAP, lo = (unsigned)nonce, hi = (unsigned)(nonce >> 32);
+    void *args[] = {&U, &P, &lo, &hi, &Bn, &m, &n, &k, &seed, &bound, &cand, &cap, &dbg};
+    return launch3(d, f, n / BN, m / BM, count, threads, smem, args);
+}
 static CUresult run_mine_fused(gpu_dev *d, CUfunction f, unsigned threads, unsigned smem, CUdeviceptr U, CUdeviceptr P, uint64_t nonce,
                                CUdeviceptr Bn, unsigned m, unsigned n, unsigned k, CUdeviceptr seed, CUdeviceptr bound,
                                CUdeviceptr cand, CUdeviceptr dbg) {
-    unsigned cap = CAND_CAP, lo = (unsigned)nonce, hi = (unsigned)(nonce >> 32);
-    void *args[] = {&U, &P, &lo, &hi, &Bn, &m, &n, &k, &seed, &bound, &cand, &cap, &dbg};
-    return launch_t(d, f, n / BN, m / BM, threads, smem, args);
+    return run_mine_fused_z(d, f, threads, smem, U, P, nonce, Bn, m, n, k, seed, bound, cand, dbg, 1);
 }
 
 // ------------------------------------------------------------------ self-test
@@ -290,6 +311,46 @@ fail:
     return ok;
 }
 
+// k_seeds vs the CPU (Merkle path of chunk 0 + seed binding) for a batch of nonces, salted and legacy
+static int selftest_seeds(gpu_dev *d) {
+    const size_t m = 128, k = 2048, N = 37;
+    int ok = 0;
+    uint8_t *A = calloc(m * k, 1), key[32], bs[32];
+    uint32_t *ctx = malloc(4 * PRL_SEEDCTX_WORDS), out[8 * 37];
+    CUdeviceptr dctx = 0, dout = 0;
+    for (int i = 0; i < 32; i++) { key[i] = (uint8_t)(i * 11 + 1); bs[i] = (uint8_t)(i * 5 + 77); }
+    prl_tree t;
+    prl_tree_build(&t, A, m * k, key, 1);
+    CK(cu.MemAlloc(&dctx, 4 * PRL_SEEDCTX_WORDS));
+    CK(cu.MemAlloc(&dout, sizeof out));
+    for (int salted = 0; salted < 2; salted++) {
+        if (prl_seed_ctx(&t, A, bs, (uint32_t)m, salted, ctx)) goto fail;
+        CK(cu.MemcpyHtoD(dctx, ctx, 4 * PRL_SEEDCTX_WORDS));
+        const uint64_t base = 0x00000007fffffff3ULL;
+        unsigned lo = (unsigned)base, hi = (unsigned)(base >> 32), cnt = N;
+        void *args[] = {&dctx, &lo, &hi, &cnt, &dout};
+        CK(launch3(d, d->f_seeds, 1, 1, 1, 256, 0, args));
+        CK(cu.StreamSynchronize(d->st));
+        CK(cu.MemcpyDtoH(out, dout, sizeof out));
+        for (size_t z = 0; z < N; z++) {
+            uint8_t c0[PRL_CHUNK], sd[32];
+            memcpy(c0, A, PRL_CHUNK);
+            prl_apply_nonce((int8_t *)c0, base + z);
+            prl_path0 p;
+            prl_tree_path0(&t, c0, &p);
+            prl_seed_a(bs, p.node[p.nlayers - 1], (uint32_t)m, salted, sd);
+            if (memcmp(sd, &out[8 * z], 32)) { LOGW("GPU%d: GPU seed self-test failed, seeds stay on the CPU", d->idx); goto fail; }
+        }
+    }
+    ok = 1;
+fail:
+    if (dctx) cu.MemFree(dctx);
+    if (dout) cu.MemFree(dout);
+    prl_tree_free(&t);
+    free(A); free(ctx);
+    return ok;
+}
+
 // ------------------------------------------------------------------ prepare
 // load function <prefix><nt> from module, self-test it, and add it to the fused candidates
 static void add_fused(gpu_dev *d, CUmodule mod, const char *prefix, unsigned smem, const char *name, int maxsm,
@@ -348,6 +409,8 @@ gpu_dev *gpu_prepare(int stat_idx, const gpu_info *info, const char *kernel, int
         CK(cu.ModuleGetFunction(&d->f_uni, mn, "k_noise_uniform"));
         CK(cu.ModuleGetFunction(&d->f_perm, mn, "k_noise_perm"));
         CK(cu.ModuleGetFunction(&d->f_apply, mn, "k_apply_noise"));
+        if (!cu.ModuleGetFunction(&d->f_seeds, mn, "k_seeds")) d->gpu_seeds = selftest_seeds(d);
+        if (d->gpu_seeds) LOGI("GPU%d: per-nonce seeds on the GPU: self-test passed", stat_idx);
         if (APPLY_SMEM(g_miner.k) > 48 * 1024)
             CK(cu.FuncSetAttribute(d->f_apply, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, APPLY_SMEM(g_miner.k)));
         char kn[32], fname[64];
@@ -552,6 +615,7 @@ static void l2_collect(gpu_dev *d, l2slot *s, uint64_t work) {
 
 static void *gpu_main(void *arg) {
     gpu_dev *d = arg;
+    double best_rate_mac_ms_g = 0;
     miner_t *M = &g_miner;
     const unsigned m = d->m, n = M->n, k = M->k;
     CUdeviceptr dA, dAn, dB, dBn, dUa, dUb, dPa, dPb, dSb, dBound;
@@ -690,10 +754,12 @@ static void *gpu_main(void *arg) {
             d->use_l2 = d->fv[sel].l2;
             snprintf(M->dev[d->idx].kernel, sizeof M->dev[d->idx].kernel, "%s-nt%d", d->fv[sel].name, M->nt);
         }
+        best_rate_mac_ms_g = best;
         LOGI("GPU%d: using kernel %s (%sH/s, matrix %ux%ux%u)", d->idx, M->dev[d->idx].kernel,
              fmt_rate(best * 1e3, b1, sizeof b1), d->use_l2 ? (unsigned)d->m_l2 : m, n, k);
     }
     if (d->use_l2) d->geom = d->geom_l2;   // attempts use the L2 geometry from here on
+    double best_rate_mac_ms = best_rate_mac_ms_g;
     const unsigned mr = d->use_l2 ? (unsigned)d->m_l2 : m;
     const uint64_t work_run = (uint64_t)mr * n * k;
     M->dev[d->idx].active = 1;
@@ -728,6 +794,116 @@ static void *gpu_main(void *arg) {
             }
             for (int i = 0; i < 2; i++)
                 if (ls[i].busy) l2_collect(d, &ls[i], work_run);
+            job_release(job);
+        }
+        M->dev[d->idx].active = 0;
+        return NULL;
+    }
+    if (d->use_fused && !d->use_l2 && d->gpu_seeds && getenv("EJ_NO_BATCH") == NULL) {
+        // Batched loop: B nonces per launch, seeds derived on the GPU (k_seeds) -> ~7 driver calls and no
+        // hashing on the CPU per batch instead of per attempt.
+        double t_ms = best_rate_mac_ms > 0 ? (double)m * n * k / best_rate_mac_ms : 1.0;
+        unsigned B = (unsigned)(4.0 / t_ms + 0.5);
+        if (B < 1) B = 1;
+        if (B > 16) B = 16;
+        LOGI("GPU%d: batches of %u nonces per launch (~%.1f ms), seeds on the GPU", d->idx, B, B * t_ms);
+        typedef struct {
+            CUdeviceptr seeds, cand;
+            uint32_t *hcand;
+            CUevent ev;
+            job_t *job;
+            uint64_t nonce;
+            int busy;
+        } bslot;
+        bslot bs[2];
+        memset(bs, 0, sizeof bs);
+        CUdeviceptr dUb_, dPb_, dctx;
+        CKF(cu.MemAlloc(&dUb_, (size_t)B * m * 128));
+        CKF(cu.MemAlloc(&dPb_, (size_t)B * 2 * k));
+        CKF(cu.MemAlloc(&dctx, 4 * PRL_SEEDCTX_WORDS));
+        uint32_t *hctx = NULL;
+        CKF(cu.MemAllocHost((void **)&hctx, 4 * PRL_SEEDCTX_WORDS));
+        for (int i = 0; i < 2; i++) {
+            CKF(cu.MemAlloc(&bs[i].seeds, 32 * B));
+            CKF(cu.MemAlloc(&bs[i].cand, CAND_WORDS * 4));
+            CKF(cu.MemAllocHost((void **)&bs[i].hcand, CAND_WORDS * 4));
+            CKF(cu.EventCreate(&bs[i].ev, 1));
+        }
+        const uint64_t work_b = (uint64_t)m * n * k * B;
+        uint8_t last_key[32];
+        int have_key = 0, curb = 0;
+        uint8_t lbs[32];
+        int hb_ok = 0;
+        while (!M->quit) {
+            job_t *job = miner_wait_job(1.0);
+            if (!job) continue;
+            uint64_t seq = job->seq;
+            if (!hb_ok || memcmp(lbs, job->work->b_seed, 32)) {
+                memcpy(hb, job->work->b_seed, 32);
+                CKF(cu.MemcpyHtoDAsync(dSb, hb, 32, d->st));
+                noise_bufs nb = {dB, dUb, dPb, dBn, dSb};
+                CKF(run_noise(d, &nb, 1, n, k, 0, 0, true));
+                memcpy(lbs, job->work->b_seed, 32);
+                hb_ok = 1;
+            }
+            if (!have_key || memcmp(last_key, job->work->job_key, 32)) {   // new header: seed context
+                CKF(cu.StreamSynchronize(d->st));
+                if (prl_seed_ctx(&job->work->g[d->geom].tree_a, M->A_base, job->work->b_seed,
+                                 (uint32_t)job->work->g[d->geom].m, job->work->salted, hctx)) {
+                    LOGE("GPU%d: seed context failed", d->idx);
+                    job_release(job);
+                    break;
+                }
+                CKF(cu.MemcpyHtoDAsync(dctx, hctx, 4 * PRL_SEEDCTX_WORDS, d->st));
+                memcpy(last_key, job->work->job_key, 32);
+                have_key = 1;
+            }
+            memcpy(hb + 32, job->bound.w, 32);
+            CKF(cu.MemcpyHtoDAsync(dBound, hb + 32, 32, d->st));
+            CKF(cu.StreamSynchronize(d->st));
+            while (!M->quit && miner_seq() == seq) {
+                bslot *q = &bs[curb];
+                if (q->busy) {
+                    CKF(cu.EventSynchronize(q->ev));
+                    uint32_t nc = q->hcand[0];
+                    if (nc > CAND_CAP) nc = CAND_CAP;
+                    for (uint32_t i = 0; i < nc; i++)
+                        miner_candidate(q->job, d->geom, d->idx, q->nonce + q->hcand[7 + 4 * i], q->hcand[4 + 4 * i],
+                                        q->hcand[5 + 4 * i]);
+                    atomic_fetch_add(&M->dev[d->idx].work, work_b);
+                    job_release(q->job);
+                    q->job = NULL;
+                    q->busy = 0;
+                }
+                q->nonce = miner_next_nonces(B);
+                q->job = job;
+                atomic_fetch_add(&job->refs, 1);
+                unsigned lo = (unsigned)q->nonce, hi = (unsigned)(q->nonce >> 32), cnt = B;
+                void *sa[] = {&dctx, &lo, &hi, &cnt, &q->seeds};
+                CKF(launch3(d, d->f_seeds, 1, 1, 1, 256, 0, sa));
+                CKF(run_noise_batch(d, q->seeds, dUb_, dPb_, m, k, B));
+                CKF(cu.MemsetD32Async(q->cand, 0, 4, d->st));
+                CKF(run_mine_fused_z(d, d->f_fused, d->threads_fused, d->smem_fused, dUb_, dPb_, q->nonce, dBn, m, n, k,
+                                     q->seeds, dBound, q->cand, 0, B));
+                CKF(cu.MemcpyDtoHAsync(q->hcand, q->cand, CAND_WORDS * 4, d->st));
+                CKF(cu.EventRecord(q->ev, d->st));
+                q->busy = 1;
+                curb ^= 1;
+            }
+            for (int i = 0; i < 2; i++) {
+                bslot *q = &bs[i];
+                if (!q->busy) continue;
+                CKF(cu.EventSynchronize(q->ev));
+                uint32_t nc = q->hcand[0];
+                if (nc > CAND_CAP) nc = CAND_CAP;
+                for (uint32_t j = 0; j < nc; j++)
+                    miner_candidate(q->job, d->geom, d->idx, q->nonce + q->hcand[7 + 4 * j], q->hcand[4 + 4 * j],
+                                    q->hcand[5 + 4 * j]);
+                atomic_fetch_add(&M->dev[d->idx].work, work_b);
+                job_release(q->job);
+                q->job = NULL;
+                q->busy = 0;
+            }
             job_release(job);
         }
         M->dev[d->idx].active = 0;

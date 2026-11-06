@@ -895,3 +895,30 @@ char *prl_base64(const uint8_t *d, size_t n) {
     o[j] = 0;
     return o;
 }
+
+// =====================================================================================
+// GPU seed context
+// =====================================================================================
+static void bytes_to_words(const uint8_t *b, int nwords, uint32_t *w) {
+    for (int i = 0; i < nwords; i++)
+        w[i] = (uint32_t)b[4 * i] | ((uint32_t)b[4 * i + 1] << 8) | ((uint32_t)b[4 * i + 2] << 16) |
+               ((uint32_t)b[4 * i + 3] << 24);
+}
+
+int prl_seed_ctx(const prl_tree *ta, const uint8_t chunk0_base[PRL_CHUNK], const uint8_t b_seed[32], uint32_t m,
+                 bool salted, uint32_t ctx[PRL_SEEDCTX_WORDS]) {
+    if (ta->nlayers < 2 || ta->nlayers > 48) return -1;
+    memset(ctx, 0, sizeof(uint32_t) * PRL_SEEDCTX_WORDS);
+    bytes_to_words(ta->key, 8, ctx);
+    bytes_to_words(b_seed, 8, ctx + 8);
+    bytes_to_words(SEED_SALT_A, 8, ctx + 16);
+    ctx[24] = m;
+    ctx[25] = salted ? 1 : 0;
+    ctx[26] = (uint32_t)ta->nlayers;
+    bytes_to_words(chunk0_base, 256, ctx + 32);
+    for (int l = 1; l < ta->nlayers; l++) {
+        if (ta->len[l - 1] < 2) return -1;
+        bytes_to_words(ta->cv[l - 1] + 32, 8, ctx + 288 + 8 * (l - 1));
+    }
+    return 0;
+}

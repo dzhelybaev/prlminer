@@ -15,7 +15,7 @@ struct WarpScratch {
     pthread_barrier_t bar;
 };
 
-static thread_local u32 t_tid, t_bx, t_by;
+static thread_local u32 t_tid, t_bx, t_by, t_bz;
 static thread_local u8 *t_smem;
 static pthread_barrier_t g_block_bar;
 static WarpScratch *g_warps;
@@ -23,6 +23,7 @@ static WarpScratch *g_warps;
 u32 emu_tid() { return t_tid; }
 u32 emu_bid_x() { return t_bx; }
 u32 emu_bid_y() { return t_by; }
+u32 emu_bid_z() { return t_bz; }
 u8 *emu_smem() { return t_smem; }
 void emu_bar_sync() { pthread_barrier_wait(&g_block_bar); }
 
@@ -91,14 +92,14 @@ void emu_ldmatrix_x4(u32 out[4], const void *row_addr) {
 }
 
 struct ThreadArg {
-    u32 tid, bx, by;
+    u32 tid, bx, by, bz;
     u8 *smem;
     const std::function<void()> *body;
 };
 
 static void *thread_main(void *p) {
     ThreadArg *a = (ThreadArg *)p;
-    t_tid = a->tid; t_bx = a->bx; t_by = a->by; t_smem = a->smem;
+    t_tid = a->tid; t_bx = a->bx; t_by = a->by; t_bz = a->bz; t_smem = a->smem;
     (*a->body)();
     return nullptr;
 }
@@ -106,6 +107,10 @@ static void *thread_main(void *p) {
 static pthread_mutex_t g_launch_mu = PTHREAD_MUTEX_INITIALIZER;   // emulator is not reentrant
 
 void emu_launch(u32 gx, u32 gy, u32 block, size_t smem_bytes, const std::function<void()> &body) {
+    emu_launch3(gx, gy, 1, block, smem_bytes, body);
+}
+
+void emu_launch3(u32 gx, u32 gy, u32 gz, u32 block, size_t smem_bytes, const std::function<void()> &body) {
     pthread_mutex_lock(&g_launch_mu);
     std::vector<u8> smem(smem_bytes + 16);
     std::vector<WarpScratch> warps((block + 31) / 32);
@@ -117,11 +122,12 @@ void emu_launch(u32 gx, u32 gy, u32 block, size_t smem_bytes, const std::functio
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256 * 1024);
+    for (u32 bz = 0; bz < gz; bz++)
     for (u32 by = 0; by < gy; by++)
         for (u32 bx = 0; bx < gx; bx++) {
             memset(smem.data(), 0xcd, smem.size());   // garbage, like real shared memory
             for (u32 t = 0; t < block; t++) {
-                args[t] = {t, bx, by, smem.data(), &body};
+                args[t] = {t, bx, by, bz, smem.data(), &body};
                 pthread_create(&th[t], &attr, thread_main, &args[t]);
             }
             for (u32 t = 0; t < block; t++) pthread_join(th[t], nullptr);
@@ -133,10 +139,14 @@ void emu_launch(u32 gx, u32 gy, u32 block, size_t smem_bytes, const std::functio
 }
 
 void emu_launch_serial(u32 gx, u32 gy, u32 block, const std::function<void()> &body) {
+    emu_launch_serial3(gx, gy, 1, block, body);
+}
+void emu_launch_serial3(u32 gx, u32 gy, u32 gz, u32 block, const std::function<void()> &body) {
+    for (u32 bz = 0; bz < gz; bz++)
     for (u32 by = 0; by < gy; by++)
         for (u32 bx = 0; bx < gx; bx++)
             for (u32 t = 0; t < block; t++) {
-                t_tid = t; t_bx = bx; t_by = by; t_smem = nullptr;
+                t_tid = t; t_bx = bx; t_by = by; t_bz = bz; t_smem = nullptr;
                 body();
             }
 }
