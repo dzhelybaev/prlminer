@@ -902,6 +902,18 @@ KERNEL LAUNCH_BOUNDS(512, 1) void k_t4p_nt16(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4a_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4b_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_B>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4c_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_C>(V2_PASS); }
+// --bench-mma breakdown of the production kernels v4c (sm_80+) and t2b (Turing); wrong results by design.
+// DIAG bits: 1 no noise generation, 2 no B loads, 4 no barriers, 8 no fold.
+KERNEL LAUNCH_BOUNDS(512, 1) void k_dv4c_1(FMINE_ARGS) { mine_v2<2, 16, 2, 2, 9, false, 1, 2>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_dv4c_2(FMINE_ARGS) { mine_v2<2, 16, 2, 2, 9, false, 2, 2>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_dv4c_8(FMINE_ARGS) { mine_v2<2, 16, 2, 2, 9, false, 8, 2>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_dv4c_3(FMINE_ARGS) { mine_v2<2, 16, 2, 2, 9, false, 3, 2>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_dv4c_15(FMINE_ARGS) { mine_v2<2, 16, 2, 2, 9, false, 15, 2>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_dt2b_1(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 1, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_dt2b_2(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 2, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_dt2b_8(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 8, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_dt2b_3(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 3, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_dt2b_15(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 15, 1, true, true>(V2_PASS); }
 // --bench-mma breakdown of v2b (wrong results by design)
 KERNEL LAUNCH_BOUNDS(256, 1) void k_diag1_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 1>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(256, 1) void k_diag2_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 2>(V2_PASS); }
