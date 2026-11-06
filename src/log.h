@@ -4,6 +4,7 @@
 enum { LOG_DEBUG = 0, LOG_INFO = 1, LOG_WARN = 2, LOG_ERR = 3 };
 extern int g_log_level;
 extern int g_log_color;
+extern int g_log_plain;   // 1: print only the message (phone-friendly output)
 void log_open_file(const char *path);
 void logmsg(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 #define LOGD(...) logmsg(LOG_DEBUG, __VA_ARGS__)

@@ -128,12 +128,12 @@ portable: $(BUILD)/ejjjminer-portable
 .PHONY: portable
 
 # ---- HiveOS package
-VERSION = 1.0.15
+VERSION = 1.0.16
 package: $(BUILD)/ejjjminer-portable
 	rm -rf $(BUILD)/pkg && mkdir -p $(BUILD)/pkg/ejjjminer
 	cp $(BUILD)/ejjjminer-portable $(BUILD)/pkg/ejjjminer/ejjjminer
-	cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh README.md LICENSE $(BUILD)/pkg/ejjjminer/
-	chmod +x $(BUILD)/pkg/ejjjminer/ejjjminer $(BUILD)/pkg/ejjjminer/h-*.sh
+	cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh hiveos/bench.sh hiveos/prof.sh README.md LICENSE $(BUILD)/pkg/ejjjminer/
+	chmod +x $(BUILD)/pkg/ejjjminer/ejjjminer $(BUILD)/pkg/ejjjminer/*.sh
 	tar -C $(BUILD)/pkg -czf $(BUILD)/ejjjminer-$(VERSION).tar.gz --owner=0 --group=0 ejjjminer
 	tar -czf $(BUILD)/ejjjminer-src-$(VERSION).tar.gz --owner=0 --group=0 --exclude=build --exclude=__pycache__ --transform 's,^\.,ejjjminer-src-$(VERSION),' .
 	@ls -la $(BUILD)/ejjjminer-$(VERSION).tar.gz $(BUILD)/ejjjminer-src-$(VERSION).tar.gz

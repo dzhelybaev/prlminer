@@ -814,12 +814,12 @@ void gpu_bench_mma(int idx, const gpu_info *info) {
     CK(cu.MemAlloc(&out, 64));
     CK(cu.EventCreate(&e0, 0));
     CK(cu.EventCreate(&e1, 0));
-    LOGI("GPU%d: %s, %d SMs, cc %d.%d — peak mma TH/s for (warps per block)x(blocks per SM):", idx,
-         info->name, info->sms, info->cc_major, info->cc_minor);
-    static const char *kname[2] = {"s8 (mining)", "s4"};
+    static const char *kname[2] = {"s8", "s4"};
+    double peak[2] = {0, 0};
+    char cfg[2][16] = {"", ""};
     for (int kind = 0; kind < 2; kind++) {
         char line[512];
-        int pos = snprintf(line, sizeof line, "GPU%d %-12s", idx, kname[kind]);
+        int pos = snprintf(line, sizeof line, "GPU%d %s", idx, kname[kind]);
         static const unsigned TH[] = {128, 256, 512, 1024};
         static const unsigned BPS[] = {1, 2};
         for (int ti = 0; ti < 4; ti++)
@@ -842,10 +842,13 @@ void gpu_bench_mma(int idx, const gpu_info *info) {
                 }
                 double macs = (double)grid * (threads / 32) * iters * 8 * (kind ? 8192.0 : 4096.0);
                 double t = ms > 0 ? macs / (ms * 1e-3) / 1e12 : 0;
-                pos += snprintf(line + pos, sizeof line - pos, " | %2ux%u: %6.2f", threads / 32, bps, t);
+                if (t > peak[kind]) { peak[kind] = t; snprintf(cfg[kind], sizeof cfg[kind], "%ux%u", threads / 32, bps); }
+                pos += snprintf(line + pos, sizeof line - pos, " %ux%u:%.1f", threads / 32, bps, t);
             }
-        LOGI("%s", line);
+        LOGD("%s", line);   // full table with --debug
     }
+    LOGI("GPU%d %s (%d SM, cc %d.%d): peak s8 %.1f TH/s, s4 %.1f TH/s", idx, info->name, info->sms, info->cc_major,
+         info->cc_minor, peak[0], peak[1]);
     {   // breakdown of the v2b mining kernel at full size: each line switches parts of the work off
         const unsigned m = 128u * info->sms, n = 2048, k = 8192;
         const v2_variant *vb = cc >= 80 ? &V2_SM80[1] : &V2_SM75[1];
@@ -861,10 +864,11 @@ void gpu_bench_mma(int idx, const gpu_info *info) {
         CK(cu.MemsetD32Async(dS, 7, 8, d->st));
         CK(cu.MemsetD32Async(dBound, 0, 8, d->st));
         static const struct { const char *fn, *what; } DK[] = {
-            {"k_v2b_nt16", "v2b full kernel"},           {"k_diag1_nt16", "- noise generation"},
-            {"k_diag2_nt16", "- B loads"},               {"k_diag3_nt16", "- generation - B loads"},
-            {"k_diag7_nt16", "- gen - loads - barriers"}, {"k_diag15_nt16", "- gen - loads - bar - fold"},
-            {"k_diag8_nt16", "- fold only"}};
+            {"k_v2b_nt16", "full"},        {"k_diag1_nt16", "-gen"},     {"k_diag2_nt16", "-B"},
+            {"k_diag3_nt16", "-gen-B"},    {"k_diag7_nt16", "-gen-B-bar"}, {"k_diag15_nt16", "mma-only"},
+            {"k_diag8_nt16", "-fold"}};
+        char bl[512];
+        int bpos = snprintf(bl, sizeof bl, "GPU%d v2b parts TH/s:", idx);
         for (size_t i = 0; i < sizeof DK / sizeof DK[0]; i++) {
             CUfunction f2;
             if (cu.ModuleGetFunction(&f2, m2, DK[i].fn) ||
@@ -880,9 +884,10 @@ void gpu_bench_mma(int idx, const gpu_info *info) {
                 cu.EventElapsedTime(&ms, e0, e1);
                 if (rep && ms < best) best = ms;
             }
-            LOGI("GPU%d breakdown %-28s %6.3f ms  %7.2f TH/s", idx, DK[i].what, best,
-                 best > 0 ? (double)m * n * k / (best * 1e-3) / 1e12 : 0);
+            bpos += snprintf(bl + bpos, sizeof bl - bpos, " %s %.1f", DK[i].what,
+                             best > 0 ? (double)m * n * k / (best * 1e-3) / 1e12 : 0);
         }
+        LOGI("%s", bl);
         CUdeviceptr fr[] = {dU, dP, dB, dS, dBound, dCand};
         for (size_t i = 0; i < 6; i++) cu.MemFree(fr[i]);
     }

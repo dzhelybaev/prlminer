@@ -7,6 +7,9 @@ if pgrep -x ejjjminer >/dev/null; then
   exit 1
 fi
 mkdir -p "$(dirname "$CUSTOM_LOG_BASENAME")"
+# phone-friendly worker commands: ejbench (benchmark), ejprof (profile summary)
+ln -sf "$PWD/bench.sh" /usr/local/bin/ejbench 2>/dev/null
+ln -sf "$PWD/prof.sh" /usr/local/bin/ejprof 2>/dev/null
 unset LD_LIBRARY_PATH
 conf=$(cat "$CUSTOM_CONFIG_FILENAME")
 

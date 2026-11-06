@@ -34,6 +34,7 @@ static void usage(void) {
         "      --list-devices      list GPUs and exit\n"
         "      --selftest          run the GPU self-test and exit\n"
         "      --bench-mma         measure peak tensor-core throughput of every GPU and exit\n"
+        "      --plain             compact output without timestamps (for HiveOS worker commands)\n"
         "      --cpu               mine on the CPU reference backend (testing only, very slow)\n"
         "protocol:\n"
         "      --tile W            hash tile width / 2: 32 (official 2x64, default), 16, 8\n"
@@ -55,7 +56,7 @@ static void usage(void) {
 }
 
 enum {
-    O_KERNEL = 1000, O_BENCHMMA, O_FUSED, O_VARIANT, O_ROWS, O_LIST, O_SELFTEST, O_CPU, O_TILE, O_K, O_COLS, O_CERT, O_SALTH, O_APIPORT,
+    O_KERNEL = 1000, O_BENCHMMA, O_PLAIN, O_FUSED, O_VARIANT, O_ROWS, O_LIST, O_SELFTEST, O_CPU, O_TILE, O_K, O_COLS, O_CERT, O_SALTH, O_APIPORT,
     O_APIHOST, O_BENCH, O_BENCHDIFF, O_PRINT, O_LOG, O_DEBUG, O_SHARET
 };
 
@@ -71,7 +72,7 @@ int main(int argc, char **argv) {
     static struct option opts[] = {
         {"pool", 1, 0, 'o'}, {"url", 1, 0, 'o'}, {"user", 1, 0, 'u'}, {"wallet", 1, 0, 'u'}, {"worker", 1, 0, 'w'},
         {"pass", 1, 0, 'p'}, {"devices", 1, 0, 'd'}, {"kernel", 1, 0, O_KERNEL}, {"fused", 1, 0, O_FUSED}, {"variant", 1, 0, O_VARIANT}, {"rows", 1, 0, O_ROWS},
-        {"list-devices", 0, 0, O_LIST}, {"selftest", 0, 0, O_SELFTEST}, {"bench-mma", 0, 0, O_BENCHMMA}, {"cpu", 0, 0, O_CPU},
+        {"list-devices", 0, 0, O_LIST}, {"selftest", 0, 0, O_SELFTEST}, {"bench-mma", 0, 0, O_BENCHMMA}, {"plain", 0, 0, O_PLAIN}, {"cpu", 0, 0, O_CPU},
         {"tile", 1, 0, O_TILE}, {"k", 1, 0, O_K}, {"cols", 1, 0, O_COLS}, {"cert", 1, 0, O_CERT},
         {"salted-height", 1, 0, O_SALTH}, {"api-port", 1, 0, O_APIPORT}, {"api-host", 1, 0, O_APIHOST},
         {"benchmark", 1, 0, O_BENCH}, {"bench-diff", 1, 0, O_BENCHDIFF}, {"print-interval", 1, 0, O_PRINT},
@@ -94,6 +95,7 @@ int main(int argc, char **argv) {
         case O_LIST: list = 1; break;
         case O_SELFTEST: selftest = 1; break;
         case O_BENCHMMA: bench_mma = 1; break;
+        case O_PLAIN: g_log_plain = 1; break;
         case O_CPU: use_cpu = 1; break;
         case O_TILE: tile = atoi(optarg); break;
         case O_K: k = atoi(optarg); break;

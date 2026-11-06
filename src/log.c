@@ -8,6 +8,7 @@
 
 int g_log_level = LOG_INFO;
 int g_log_color = -1;
+int g_log_plain = 0;
 static FILE *g_logf;
 static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -32,7 +33,8 @@ void logmsg(int level, const char *fmt, ...) {
     static const char *tag[] = {"DBG", "INF", "WRN", "ERR"};
     static const char *col[] = {"\033[90m", "", "\033[33m", "\033[31m"};
     pthread_mutex_lock(&g_log_mu);
-    if (g_log_color) printf("%s[%s] %s %s\033[0m\n", col[level], ts, tag[level], msg);
+    if (g_log_plain) printf("%s%s\n", level >= LOG_WARN ? "! " : "", msg);
+    else if (g_log_color) printf("%s[%s] %s %s\033[0m\n", col[level], ts, tag[level], msg);
     else printf("[%s] %s %s\n", ts, tag[level], msg);
     fflush(stdout);
     if (g_logf) fprintf(g_logf, "[%s] %s %s\n", ts, tag[level], msg);
