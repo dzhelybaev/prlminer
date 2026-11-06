@@ -40,9 +40,21 @@ KERNEL void k_noise_uniform(const u32 *key8, u32 label_b, u32 nblocks, i8 *out) 
 #pragma unroll
     for (int i = 0; i < 16; i++) m[i] = 0;
     m[0] = 1 + idx;
-    m[8] = label_b ? 0x65745f42u : 0x65745f41u;   // "B_te" / "A_te" (LE)
-    m[9] = 0x726f736eu;                           // "nsor"
+    m[8] = (label_b & 1) ? 0x65745f42u : 0x65745f41u;   // "B_te" / "A_te" (LE)
+    m[9] = 0x726f736eu;                                 // "nsor"
     b3_keyed64(key, m, h);
+    if (label_b & 2) {
+        // ELt layout (GPU-side table for the fused kernels, see mine_v2 EG): per 128-row block b a 16 KB table
+        // of words (f, rg) holding the bytes U[b*128 + rg + 32j][f], j = 0..3 (byte j of word f*32 + rg).
+        const u32 r = idx >> 2, f0 = (idx & 3) * 32, blk = r >> 7, rl = r & 127;
+        u8 *t = (u8 *)out + (u64)blk * 16384 + (rl >> 5);
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            u32 v = (u32)(u8)((((h[i >> 2] >> (8 * (i & 3))) & 63) - 32));
+            t[((f0 + i) * 32 + (rl & 31)) * 4] = (u8)v;
+        }
+        return;
+    }
     u32 *o = (u32 *)(out + (u64)idx * 32);
 #pragma unroll
     for (int i = 0; i < 8; i++) {
@@ -65,7 +77,7 @@ KERNEL void k_noise_perm(const u32 *key8, u32 label_b, u32 k, u8 *pairs) {
 #pragma unroll
     for (int t = 0; t < 16; t++) m[t] = 0;
     m[1] = 1 + i;
-    m[8] = label_b ? 0x65745f42u : 0x65745f41u;
+    m[8] = (label_b & 1) ? 0x65745f42u : 0x65745f41u;
     m[9] = 0x726f736eu;
     b3_keyed64(key, m, h);
 #pragma unroll
@@ -448,9 +460,15 @@ DEVINL void mine_body(const i8 *A, const i8 *U, const u8 *P, u32 nlo, u32 nhi, c
 #define V2_ASYNC 0
 #endif
 #if defined(PRL_EMU)
+DEVINL u32 ldg32nc(const u32 *p) { return *p; }
 DEVINL void ldg128(u32 r[4], const void *p) { __builtin_memcpy(r, p, 16); }
 DEVINL void sts128(void *p, const u32 r[4]) { __builtin_memcpy(p, r, 16); }
 #else
+DEVINL u32 ldg32nc(const u32 *p) {
+    u32 v;
+    asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
 DEVINL void ldg128(u32 r[4], const void *p) {
     asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "l"(p));
 }
@@ -470,7 +488,10 @@ DEVINL u32 v2_off(u32 r, u32 c) { return (r >> 2) * 128u + 16u * ((2u * (r & 3u)
 // partner warp hands its per-chunk XOR to the owner through shared memory, only owners keep transcripts.
 // GEN = false ("L2" kernels): U is the noised A' (m x k) produced by k_apply_noise; the A tile is copied
 // like B (no noise generation in the GEMM). Meant for A' + B' resident in L2.
-template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0, int HS = 1, bool GEN = true>
+// EG = true: the transposed uniform table (ELt) is read from global memory (U, produced by k_noise_uniform
+// with the ELt layout flag) instead of being staged in shared memory -> 16 KB more smem for transcripts.
+template <int MT, int NT, int BKS, int STG, int JSM, bool PF, int DIAG = 0, int HS = 1, bool GEN = true,
+          bool EG = false>
 DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u32 m, u32 n, u32 k,
                     const u32 *seed8, const u32 *bound8, u32 *cand, u32 cand_cap, u32 *dbg) {
     constexpr int NTW = NT / HS;                 // n8 sub-tiles per warp
@@ -479,7 +500,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     constexpr int JS = JSM > MT ? MT : JSM;   // sub-tiles 0..JS-1 keep transcript words in smem
     constexpr int NOWN = NTH / HS;               // threads that own hash tiles
     constexpr u32 STAGE = BKS * V2_SLICE;
-    constexpr u32 ELT = STG * STAGE, JPO = ELT + 128 * 128;   // byte offsets of ELt and the transcript words
+    constexpr u32 ELT = STG * STAGE, JPO = ELT + (EG ? 0 : 128 * 128);   // byte offsets of ELt and transcripts
     constexpr u32 XSO = JPO + 64 * JS * NOWN;                 // HS = 2: partner XOR exchange (MT words / owner)
     DYN_SMEM(smem);
     {   // batch: nonce index z (grid z): own seed, nonce, uniform rows + pairs (GEN) or A' (L2)
@@ -508,6 +529,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     const u32 a_st = v2_off(tid >> 1, tid & 1);                     // GEN = false: A chunk (threads < 256)
     const i8 *asrc = U + (u64)(row0 + ((tid >> 1) & 127)) * k + 16 * (tid & 1);
     const saddr_t elt = sb + ELT + 4 * lane, jpa = sb + JPO + 4 * ot, xsa = sb + XSO + 4 * ot;
+    const u32 *eltg = (const u32 *)(U + (u64)BID_Y * 16384) + lane;   // EG: this block's table in global
 
     i32 acc[MT][NTW][4];
     u32 jpr[MT][16];
@@ -523,7 +545,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
     }
     const u32 *P32 = (const u32 *)P;
     u32 pw0, pw1, gen_kt = 0;
-    if (GEN && warp < 8) {   // stage this block's 128 uniform rows transposed: word (f, rg) = bytes U[rg + 32j][f]
+    if (GEN && !EG && warp < 8) {   // stage this block's 128 uniform rows transposed: word (f, rg) = bytes U[rg + 32j][f]
         const u32 fb = warp * 16;
         u32 x[4][4];
 #pragma unroll
@@ -542,6 +564,7 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         pw0 = P32[2 * warp];
         pw1 = P32[2 * warp + 1];
     }
+    if (GEN && EG && warp < 8) { pw0 = P32[2 * warp]; pw1 = P32[2 * warp + 1]; }
     BAR_SYNC();
     const u32 nk = k / 32, ns = nk / BKS;
 
@@ -552,7 +575,8 @@ DEVINL void mine_v2(const i8 *U, const u8 *P, u32 nlo, u32 nhi, const i8 *Bt, u3
         for (int i = 0; i < 4; i++) {
             u32 pw = i < 2 ? pw0 : pw1;
             u32 f = (pw >> (16 * (i & 1))) & 0xffu, sc = (pw >> (16 * (i & 1) + 8)) & 0xffu;
-            wv[i] = bsub4(lds32(elt + 128 * f), lds32(elt + 128 * sc));
+            if constexpr (EG) wv[i] = bsub4(ldg32nc(eltg + 32 * f), ldg32nc(eltg + 32 * sc));
+            else wv[i] = bsub4(lds32(elt + 128 * f), lds32(elt + 128 * sc));
         }
         u32 r[4];
         transpose4(wv[0], wv[1], wv[2], wv[3], r);
@@ -867,6 +891,13 @@ KERNEL LAUNCH_BOUNDS(256, 1) void k_l2a_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_A, 
 KERNEL LAUNCH_BOUNDS(256, 1) void k_l2b_nt16(FMINE_ARGS) { mine_v2<2, 16, V2_B, 0, 1, false>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_l3b_nt16(FMINE_ARGS) { mine_v2<1, 16, V3_B, 0, 1, false>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_l4c_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_C, false>(V2_PASS); }
+// t-variants: transcripts fully in smem, ELt table read from global (L1) instead of smem (aimed at Turing,
+// where 64 KB of smem cannot hold ELt + stages + transcripts). Parameters: BKS, STG, JSM, PF, DIAG, HS, GEN, EG.
+KERNEL LAUNCH_BOUNDS(256, 1) void k_t2b_nt16(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 0, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(256, 1) void k_t2p_nt16(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, true, 0, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_t3b_nt16(FMINE_ARGS) { mine_v2<1, 16, 1, 2, 9, false, 0, 1, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_t4b_nt16(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, false, 0, 2, true, true>(V2_PASS); }
+KERNEL LAUNCH_BOUNDS(512, 1) void k_t4p_nt16(FMINE_ARGS) { mine_v2<2, 16, 1, 2, 9, true, 0, 2, true, true>(V2_PASS); }
 // v4: 512 threads, warp tile 32x64, hash tile split over 2 warps
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4a_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_A>(V2_PASS); }
 KERNEL LAUNCH_BOUNDS(512, 1) void k_v4b_nt16(FMINE_ARGS) { mine_v2<2, 16, V4_B>(V2_PASS); }

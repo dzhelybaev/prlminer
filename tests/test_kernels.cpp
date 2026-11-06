@@ -20,6 +20,17 @@ static void key_to_words(const uint8_t k[32], u32 w[8]) {
     for (int i = 0; i < 8; i++) w[i] = k[4 * i] | (k[4 * i + 1] << 8) | (k[4 * i + 2] << 16) | ((u32)k[4 * i + 3] << 24);
 }
 
+// ELt layout of uniform rows (see k_noise_uniform label bit 2 / mine_v2 EG)
+static std::vector<i8> to_elt(const std::vector<i8> &U, u32 m) {
+    std::vector<i8> E(m * 128);
+    for (u32 r = 0; r < m; r++)
+        for (u32 f = 0; f < 128; f++) {
+            u32 b = r >> 7, rl = r & 127;
+            E[(size_t)b * 16384 + (f * 32 + (rl & 31)) * 4 + (rl >> 5)] = U[(size_t)r * 128 + f];
+        }
+    return E;
+}
+
 static uint32_t rng_state = 99;
 static int8_t rnd_val() { rng_state = rng_state * 1664525u + 1013904223u; return (int8_t)((int)((rng_state >> 16) % 129) - 64); }
 
@@ -47,6 +58,13 @@ static void test_noise() {
             prl_noise_uniform_row(lb ? PRL_LABEL_B : PRL_LABEL_A, key, r, ref);
             CHECK(!memcmp(ref, &uni[r * 128], 128), "uniform row %u label %d", r, lb);
         }
+        {   // ELt layout output (label bit 2) must equal the transposition of the plain rows
+            const u32 rows2 = 256, nb2 = rows2 * 4;
+            std::vector<i8> plain(rows2 * 128), elt(rows2 * 128);
+            emu_launch_serial((nb2 + 255) / 256, 1, 256, [&]() { k_noise_uniform(kw, lb, nb2, plain.data()); });
+            emu_launch_serial((nb2 + 255) / 256, 1, 256, [&]() { k_noise_uniform(kw, lb | 2, nb2, elt.data()); });
+            CHECK(to_elt(plain, rows2) == elt, "uniform ELt layout label %d", lb);
+        }
         std::vector<u8> pairs(2 * k), rp(2 * k);
         emu_launch((k / 8 + 255) / 256, 1, 256, 0, [&]() { k_noise_perm(kw, lb, k, pairs.data()); });
         prl_noise_perm(lb ? PRL_LABEL_B : PRL_LABEL_A, key, k, rp.data());
@@ -71,7 +89,7 @@ static void test_noise() {
 }
 
 static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k, fmine_fn ffn = nullptr, u32 fsmem = 0,
-                      u32 threads = NTHREADS, bool l2 = false) {
+                      u32 threads = NTHREADS, bool l2 = false, bool eg = false) {
     std::vector<i8> A(m * k), Bt(n * k), U(m * 128);
     std::vector<u8> P(2 * k);
     const uint64_t nonce = 0x0123456789abcdefULL ^ ((uint64_t)m << 40);
@@ -126,9 +144,10 @@ static void test_mine(const char *name, mine_fn fn, int nt, u32 m, u32 n, u32 k,
     u256 bound;
     u256_from_le_bytes(&bound, le.data());
     std::vector<u32> dbg(ntiles * 16, 0xdeadbeef), cand(4 + 4 * 64, 0);
+    std::vector<i8> UE = to_elt(U, m);
     if (ffn)
         emu_launch(n / BN, m / BM, threads, fsmem ? fsmem : STAGES * STAGE_BYTES + FUSED_SMEM, [&]() {
-            ffn(l2 ? A.data() : U.data(), P.data(), (u32)nonce, (u32)(nonce >> 32), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64,
+            ffn(l2 ? A.data() : (eg ? UE.data() : U.data()), P.data(), (u32)nonce, (u32)(nonce >> 32), Bt.data(), m, n, k, sw, bound.w, cand.data(), 64,
                 dbg.data());
         });
     else
@@ -269,6 +288,11 @@ int main() {
         }
         test_mine("k_v3a_nt16", nullptr, 16, 128, 256, 2048, k_v3a_nt16, 131072, 512);
         test_mine("k_v3b_nt16", nullptr, 16, 128, 256, 2048, k_v3b_nt16, 131072, 512);
+        test_mine("k_t2b_nt16", nullptr, 16, 256, 512, 4096, k_t2b_nt16, 131072, 256, false, true);
+        test_mine("k_t2p_nt16", nullptr, 16, 128, 256, 2048, k_t2p_nt16, 131072, 256, false, true);
+        test_mine("k_t3b_nt16", nullptr, 16, 256, 256, 2048, k_t3b_nt16, 131072, 512, false, true);
+        test_mine("k_t4b_nt16", nullptr, 16, 256, 512, 4096, k_t4b_nt16, 131072, 512, false, true);
+        test_mine("k_t4p_nt16", nullptr, 16, 128, 256, 2048, k_t4p_nt16, 131072, 512, false, true);
         test_mine("k_l2a_nt16", nullptr, 16, 128, 256, 2048, k_l2a_nt16, 131072, 256, true);
         test_mine("k_l2b_nt16", nullptr, 16, 256, 512, 4096, k_l2b_nt16, 131072, 256, true);
         test_mine("k_l3b_nt16", nullptr, 16, 256, 256, 2048, k_l3b_nt16, 131072, 512, true);

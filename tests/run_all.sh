@@ -37,5 +37,6 @@ LD_LIBRARY_PATH=build/fakecuda e2e gpu 34102 0.05 ./build/ejjjminer-portable --r
 echo "== end-to-end: v2 fused kernel (emulated) -> mock pool"
 LD_LIBRARY_PATH=build/fakecuda e2e gpu_v2 34103 0.05 ./build/ejjjminer-portable --rows 128 --tile 16 --variant v2b
 LD_LIBRARY_PATH=build/fakecuda e2e gpu_v3 34104 0.05 ./build/ejjjminer-portable --rows 128 --tile 16 --variant v4c
+FAKE_CUDA_CC=75 LD_LIBRARY_PATH=build/fakecuda e2e gpu_t4 34112 0.05 ./build/ejjjminer-portable --rows 128 --tile 16 --variant t4b
 LD_LIBRARY_PATH=build/fakecuda e2e gpu_l2 34105 0.05 ./build/ejjjminer-portable --tile 16 --variant l2b
 echo "ALL TESTS PASSED"

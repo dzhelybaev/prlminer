@@ -23,6 +23,7 @@ function gpu(s) { sub(/:$/, "", s); if (!(s in seen)) { seen[s] = 1; order[++ng]
 /^GPU[0-9]+: profile: [a-z0-9]+ +attempt/ {
     g = gpu($1); r = $0; sub(/^.*\(/, "", r); sub(/ .*/, "", r); prof[g] = prof[g] " " $3 " " r; next }
 /^GPU[0-9]+: using kernel/ { g = gpu($1); u = $0; sub(/^GPU[0-9]+: using kernel /, "", u); sub(/, matrix.*/, ")", u); use[g] = u; next }
+/^GPU[0-9]+: batches of / { g = gpu($1); bt[g] = $4; next }
 /^total / { tot = $0; next }
 /^! / { w[++nw] = $0; next }
 END {
@@ -31,7 +32,7 @@ END {
         if (l2[g] != "") print "  " l2[g]
         if (prof[g] != "") print " " prof[g]
         if (spill[g] != "") print "  spills:" spill[g]
-        if (use[g] != "") print "  => " use[g]
+        if (use[g] != "") print "  => " use[g] (bt[g] != "" ? ", batch " bt[g] : "")
     }
     for (i = (nw > 6 ? nw - 5 : 1); i <= nw; i++) print w[i]
     if (tot != "") print tot

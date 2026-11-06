@@ -29,7 +29,7 @@ static void usage(void) {
         "      --kernel K          auto | mma (tensor cores, RTX 20xx+) | dp4a (default auto)\n"
         "      --fused M           auto | on | off: noise generated inside the GEMM kernel\n"
         "                          (auto = measure all kernels at start, use the fastest; default auto)\n"
-        "      --variant V         force a kernel variant: fmma | v2a..v2c | v3a | v3b | v4a..v4c | l2a | l2b | l3b | l4c (default: fastest)\n"
+        "      --variant V         force a kernel variant: fmma | v2a..v4c | l2a..l4c | t2b | t2p | t3b | t4b | t4p (default: fastest)\n"
         "      --rows N            matrix rows per attempt (default: 128 x SM count)\n"
         "      --list-devices      list GPUs and exit\n"
         "      --selftest          run the GPU self-test and exit\n"
